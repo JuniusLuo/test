@@ -28,7 +28,7 @@ message DataBlock {
 }
 
 message ObjectMD {
-  ObjectSMD smd;
-  DataBlock data;
+  ObjectSMD smd = 1;
+  DataBlock data = 2;
 }
 // [END messages]
