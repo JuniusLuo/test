@@ -1,0 +1,34 @@
+// See README.txt for information and build instructions.
+//
+// Note: START and END tags are used in comments to define sections used in
+// tutorials.  They are not part of the syntax for Protocol Buffers.
+//
+// To get an in-depth walkthrough of this file and the related examples, see:
+// https://developers.google.com/protocol-buffers/docs/tutorials
+
+// [START declaration]
+syntax = "proto3";
+package test;
+// [END declaration]
+
+// [START messages]
+message ObjectSMD {
+  string name = 1;
+  string bucket = 2;
+  int64 size = 3;
+  int64 mtime = 4;
+  string etag = 5;
+}
+
+message DataBlock {
+  // data block size, such as 128KB
+  int32 blockSize = 1;
+  // data blocks
+  repeated string blocks = 2;
+}
+
+message ObjectMD {
+  ObjectSMD smd;
+  DataBlock data;
+}
+// [END messages]
