@@ -1,15 +1,21 @@
 package main
 
 import (
-  "test"
+	"flag"
+	"net/http"
+	"test"
 
-  "net/http"
-
-  "github.com/golang/glog"
+	"github.com/golang/glog"
 )
 
 func main() {
-  s := new(test.Server)
 
-  glog.Fatal(http.ListenAndServe(":8080", s))
+	flag.Parse()
+
+	s := test.NewS3Server()
+	if s == nil {
+		return
+	}
+
+	glog.Fatal(http.ListenAndServe(":8080", s))
 }

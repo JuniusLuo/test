@@ -1,8 +1,25 @@
 package test
 
+// Misc system default configs
+const (
+	// default read 128KB
+	ReadBufferSize = 131072
+)
+
+//const (
+//  c0 = itoa // == 0
+//  c1 // == 1
+//)
+
+// S3 related operation definitions
+const (
+	BucketListOp = "/?list-type=2"
+)
+
 // S3 error code
 const (
 	StatusOK                     = 200
+	StatusOKStr                  = "OK"
 	AccessDenied                 = 403
 	BadDigest                    = 400
 	BucketAlreadyExists          = 409
@@ -38,10 +55,4 @@ const (
 	ServiceUnavailable           = 503
 	SlowDown                     = 503
 	TokenRefreshRequired         = 400
-)
-
-// Misc system default configs
-const (
-	// default read 128KB
-	ReadBufferSize = 131072
 )
