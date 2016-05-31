@@ -1,11 +1,16 @@
 package test
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"flag"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 )
 
 var ioengine = flag.String("io", "fileio", "the cloud ioengine: fileio or cloudio")
@@ -53,6 +58,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.getOp(r, resp, bkname, objname)
 	case "HEAD":
 	case "DELETE":
+		s.delOp(r, resp, bkname, objname)
 	case "OPTIONS":
 	default:
 		glog.Errorln("unsupported request", r.Method, r.URL)
@@ -129,15 +135,175 @@ func (s *S3Server) isBucketOp(objname string) bool {
 func (s *S3Server) putOp(r *http.Request, resp *http.Response, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		resp.StatusCode, resp.Status = s.s3io.PutBucket(bkname)
-		glog.Infoln("put buckeet succeeded", bkname, r.URL, r.Host)
+		glog.Infoln("put bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
 	} else {
 		s.putObject(r, resp, bkname, objname)
 	}
 }
 
-func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) readFullBuf(r *http.Request, readBuf []byte) (n int, err error) {
+	readZero := false
+	var rlen int
+	for rlen < len(readBuf) {
+		n, err = r.Body.Read(readBuf[rlen:])
+		rlen += n
 
+		if err != nil {
+			return rlen, err
+		}
+
+		if n == 0 && err == nil {
+			if readZero {
+				glog.Errorln("read 0 bytes from http with nil error twice", r.URL, r.Host)
+				return rlen, err
+			}
+			// allow read 0 byte with nil error once
+			readZero = true
+		}
+	}
+	return rlen, err
+}
+
+// read object data and create data blocks.
+// this func will update data blocks and etag in ObjectMD
+func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, errmsg string) {
+	var readBuf []byte
+	if r.ContentLength > ReadBufferSize {
+		readBuf = make([]byte, ReadBufferSize)
+	} else {
+		readBuf = make([]byte, r.ContentLength)
+	}
+
+	md5ck := md5.New()
+	etag := md5.New()
+
+	var totalBlocks int
+	var ddBlocks int
+
+	var rlen int64
+	for rlen < r.ContentLength {
+		// read one block
+		n, err := s.readFullBuf(r, readBuf)
+		rlen += int64(n)
+		glog.V(4).Infoln("read", n, err, "total readed len", rlen,
+			"specified read len", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+
+		if err != nil {
+			if err != io.EOF {
+				glog.Errorln("failed to read data from http", err, "readed len", rlen,
+					"ContentLength", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+				return InternalError, "failed to read data from http"
+			}
+
+			// EOF, check if all contents are readed
+			if rlen != r.ContentLength {
+				glog.Errorln("read", rlen, "less than ContentLength",
+					r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+				return InvalidRequest, "data less than ContentLength"
+			}
+
+			// EOF, check if the last data block is 0
+			if n == 0 {
+				break // break the for loop
+			}
+
+			// write out the last data block
+		}
+
+		// compute checksum
+		md5ck.Write(readBuf[:n])
+		md5byte := md5ck.Sum(nil)
+		md5str := hex.EncodeToString(md5byte)
+		// reset md5 for the next block
+		md5ck.Reset()
+
+		// update etag
+		etag.Write(readBuf[:n])
+
+		// add to data block
+		md.Data.Blocks = append(md.Data.Blocks, md5str)
+
+		// write data block
+		if !s.s3io.IsDataBlockExist(md5str) {
+			status, errmsg := s.s3io.WriteDataBlock(readBuf[:n], md5str)
+			if status != StatusOK {
+				glog.Errorln("failed to create data block", md5str,
+					status, errmsg, md.Smd.Bucket, md.Smd.Name)
+				return status, errmsg
+			}
+			glog.V(2).Infoln("created data block", md5str, md.Smd.Bucket, md.Smd.Name)
+		} else {
+			ddBlocks++
+			glog.V(2).Infoln("data block exists", md5str, md.Smd.Bucket, md.Smd.Name)
+		}
+		totalBlocks++
+	}
+
+	glog.V(1).Infoln(md.Smd.Bucket, md.Smd.Name, r.ContentLength,
+		"totalBlocks", totalBlocks, "ddBlocks", ddBlocks)
+
+	etagbyte := etag.Sum(nil)
+	md.Smd.Etag = hex.EncodeToString(etagbyte)
+	return StatusOK, StatusOKStr
+}
+
+func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+	// Performance is one critical factor for this dedup layer. Not doing the
+	// additional operations here, such as bucket permission check, etc.
+	// When creating the metadata object, S3 will do all the checks. If S3
+	// rejects the request, no positive refs will be added for the data blocks.
+	// gc will clean up them in the background.
+
+	// create the metadata object
+	smd := &ObjectSMD{}
+	smd.Bucket = bkname
+	smd.Name = objname
+	smd.Mtime = time.Now().Unix()
+	smd.Size = r.ContentLength
+
+	data := &DataBlock{}
+	data.BlockSize = ReadBufferSize
+
+	md := &ObjectMD{}
+	md.Smd = smd
+	md.Data = data
+
+	// read object data and create data blocks
+	status, errmsg := s.putObjectData(r, md)
+	if status != StatusOK {
+		resp.StatusCode = status
+		resp.Status = errmsg
+		return
+	}
+
+	// Marshal ObjectMD to []byte
+	mdbyte, err := proto.Marshal(md)
+	if err != nil {
+		glog.Errorln("failed to Marshal ObjectMD", md, err)
+		resp.StatusCode = InternalError
+		resp.Status = "failed to Marshal ObjectMD"
+		return
+	}
+
+	// write out ObjectMD
+	status, errmsg = s.s3io.WriteObjectMD(bkname, objname, mdbyte)
+	if status != StatusOK {
+		resp.StatusCode = status
+		resp.Status = errmsg
+		return
+	}
+
+	glog.V(0).Infoln("successfully created object", bkname, objname, md.Smd.Etag)
 }
 
 func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+}
+
+func (s *S3Server) delOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+	if s.isBucketOp(objname) {
+		resp.StatusCode, resp.Status = s.s3io.DeleteBucket(bkname)
+		glog.Infoln("del bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+	} else {
+		s.putObject(r, resp, bkname, objname)
+	}
 }

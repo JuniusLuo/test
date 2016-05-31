@@ -1,6 +1,7 @@
 package test
 
 import (
+	"io/ioutil"
 	"os"
 	"strings"
 
@@ -16,7 +17,8 @@ type FileIO struct {
 
 // Misc const definition for FileIO
 const (
-	DefaultDirMode = 0700
+	DefaultDirMode  = 0700
+	DefaultFileMode = 0600
 )
 
 // NewFileIO creates the FileIO instance
@@ -24,7 +26,7 @@ func NewFileIO() *FileIO {
 	f := new(FileIO)
 	f.rootDir = "/tmp/clouddd/"
 	f.rootBucketDir = f.rootDir + "bucket/"
-	f.rootDataDir = f.rootDir + "data"
+	f.rootDataDir = f.rootDir + "data/"
 
 	err := os.MkdirAll(f.rootBucketDir, DefaultDirMode)
 	if err != nil && !os.IsExist(err) {
@@ -69,6 +71,39 @@ func (f *FileIO) DeleteBucket(bkname string) (status int, errmsg string) {
 			return BucketNotEmpty, "BucketNotEmpty"
 		}
 		return InternalError, "failed to delete bucket"
+	}
+	return StatusOK, StatusOKStr
+}
+
+// IsDataBlockExist checks if the data block exists
+func (f *FileIO) IsDataBlockExist(md5str string) bool {
+	fname := f.rootDataDir + md5str
+	_, err := os.Stat(fname)
+	if err == nil {
+		return true
+	}
+	glog.V(4).Infoln("data block not exist", md5str, err)
+	return false
+}
+
+// WriteDataBlock creates the data block under the data bucket
+func (f *FileIO) WriteDataBlock(buf []byte, md5str string) (status int, errmsg string) {
+	fname := f.rootDataDir + md5str
+	err := ioutil.WriteFile(fname, buf, DefaultFileMode)
+	if err != nil {
+		glog.Errorln("failed to write file", fname, err)
+		return InternalError, "failed to create data block file"
+	}
+	return StatusOK, StatusOKStr
+}
+
+// WriteObjectMD creates the metadata object
+func (f *FileIO) WriteObjectMD(bkname string, objname string, mdbuf []byte) (status int, errmsg string) {
+	fname := f.rootBucketDir + bkname + objname
+	err := ioutil.WriteFile(fname, mdbuf, DefaultFileMode)
+	if err != nil {
+		glog.Errorln("failed to create metadata object file", fname, err)
+		return InternalError, "failed to create metadata file"
 	}
 	return StatusOK, StatusOKStr
 }
