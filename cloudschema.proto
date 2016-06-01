@@ -23,8 +23,12 @@ message ObjectSMD {
 message DataBlock {
   // data block size, such as 128KB
   int32 blockSize = 1;
+  // the draft estimation of the dedup blocks. this may not be
+  // accurate as concurrent puts could come around the same time.
+  // there could have more dedup blocks, but will not less.
+  int64 ddBlocks = 2;
   // data blocks
-  repeated string blocks = 2;
+  repeated string blocks = 3;
 }
 
 message ObjectMD {

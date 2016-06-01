@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"flag"
+	"hash"
 	"io"
 	"net/http"
 	"strings"
@@ -164,21 +165,112 @@ func (s *S3Server) readFullBuf(r *http.Request, readBuf []byte) (n int, err erro
 	return rlen, err
 }
 
+// if object data < ReadBufferSize
+func (s *S3Server) putSmallObjectData(r *http.Request, md *ObjectMD) (status int, errmsg string) {
+	readBuf := make([]byte, r.ContentLength)
+
+	// read all data
+	n, err := s.readFullBuf(r, readBuf)
+	glog.V(4).Infoln("read", n, err, "ContentLength",
+		r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+
+	if err != nil {
+		if err != io.EOF {
+			glog.Errorln("failed to read data from http", err, "ContentLength",
+				r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+			return InternalError, "failed to read data from http"
+		}
+
+		// EOF, check if all contents are readed
+		if int64(n) != r.ContentLength {
+			glog.Errorln("read", n, "less than ContentLength",
+				r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+			return InvalidRequest, "data less than ContentLength"
+		}
+	}
+
+	// compute checksum
+	m := md5.New()
+	m.Write(readBuf)
+	md5byte := m.Sum(nil)
+	md5str := hex.EncodeToString(md5byte)
+	m.Reset()
+
+	// write data block
+	if !s.s3io.IsDataBlockExist(md5str) {
+		status, errmsg = s.s3io.WriteDataBlock(readBuf, md5str)
+		if status != StatusOK {
+			glog.Errorln("failed to create data block",
+				md5str, status, errmsg, md.Smd.Bucket, md.Smd.Name)
+			return status, errmsg
+		}
+		glog.V(2).Infoln("create data block", md5str, r.ContentLength)
+	} else {
+		md.Data.DdBlocks = 1
+		glog.V(2).Infoln("data block exists", md5str, r.ContentLength)
+	}
+
+	// add to data block
+	md.Data.BlockSize = int32(r.ContentLength)
+	md.Data.Blocks = append(md.Data.Blocks, md5str)
+
+	// set etag
+	md.Smd.Etag = md5str
+	return StatusOK, StatusOKStr
+}
+
+type writeDataBlockResult struct {
+	md5str string // data block md5
+	exist  bool   // whether data block exists
+	status int
+	errmsg string
+}
+
+func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash, c chan<- writeDataBlockResult) {
+	// compute checksum
+	md5ck.Write(buf)
+	md5byte := md5ck.Sum(nil)
+	md5str := hex.EncodeToString(md5byte)
+	// reset md5 for the next block
+	md5ck.Reset()
+
+	// update etag
+	etag.Write(buf)
+
+	res := writeDataBlockResult{md5str, true, StatusOK, StatusOKStr}
+
+	// write data block
+	if !s.s3io.IsDataBlockExist(md5str) {
+		res.exist = false
+		res.status, res.errmsg = s.s3io.WriteDataBlock(buf, md5str)
+		glog.V(2).Infoln("create data block", md5str, res.status)
+	} else {
+		glog.V(2).Infoln("data block exists", md5str)
+	}
+
+	c <- res
+}
+
 // read object data and create data blocks.
 // this func will update data blocks and etag in ObjectMD
 func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, errmsg string) {
-	var readBuf []byte
-	if r.ContentLength > ReadBufferSize {
-		readBuf = make([]byte, ReadBufferSize)
-	} else {
-		readBuf = make([]byte, r.ContentLength)
+	if r.ContentLength <= ReadBufferSize {
+		return s.putSmallObjectData(r, md)
 	}
+
+	readBuf := make([]byte, ReadBufferSize)
+	writeBuf := make([]byte, ReadBufferSize)
 
 	md5ck := md5.New()
 	etag := md5.New()
 
-	var totalBlocks int
-	var ddBlocks int
+	var totalBlocks int64
+	// minimal dd blocks
+	var ddBlocks int64
+
+	// chan to wait till the previous write completes
+	c := make(chan writeDataBlockResult)
+	waitWrite := false
 
 	var rlen int64
 	for rlen < r.ContentLength {
@@ -210,33 +302,50 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 			// write out the last data block
 		}
 
-		// compute checksum
-		md5ck.Write(readBuf[:n])
-		md5byte := md5ck.Sum(nil)
-		md5str := hex.EncodeToString(md5byte)
-		// reset md5 for the next block
-		md5ck.Reset()
+		if waitWrite {
+			// wait data block write done
+			res := <-c
 
-		// update etag
-		etag.Write(readBuf[:n])
+			if res.status != StatusOK {
+				glog.Errorln("failed to create data block", res.md5str,
+					res.status, res.errmsg, md.Smd.Bucket, md.Smd.Name)
+				return res.status, res.errmsg
+			}
 
-		// add to data block
-		md.Data.Blocks = append(md.Data.Blocks, md5str)
+			if res.exist {
+				ddBlocks++
+			}
+			totalBlocks++
+			// add to data block
+			md.Data.Blocks = append(md.Data.Blocks, res.md5str)
+		}
 
 		// write data block
-		if !s.s3io.IsDataBlockExist(md5str) {
-			status, errmsg := s.s3io.WriteDataBlock(readBuf[:n], md5str)
-			if status != StatusOK {
-				glog.Errorln("failed to create data block", md5str,
-					status, errmsg, md.Smd.Bucket, md.Smd.Name)
-				return status, errmsg
-			}
-			glog.V(2).Infoln("created data block", md5str, md.Smd.Bucket, md.Smd.Name)
-		} else {
+		// switch buffer, readBuf will be used to read the next data block
+		tmpbuf := readBuf
+		readBuf = writeBuf
+		writeBuf = tmpbuf
+		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag, c)
+		waitWrite = true
+	}
+
+	// wait the last write
+	if waitWrite {
+		// wait data block write done
+		res := <-c
+
+		if res.status != StatusOK {
+			glog.Errorln("failed to create data block", res.md5str,
+				res.status, res.errmsg, md.Smd.Bucket, md.Smd.Name)
+			return res.status, res.errmsg
+		}
+
+		if res.exist {
 			ddBlocks++
-			glog.V(2).Infoln("data block exists", md5str, md.Smd.Bucket, md.Smd.Name)
 		}
 		totalBlocks++
+		// add to data block
+		md.Data.Blocks = append(md.Data.Blocks, res.md5str)
 	}
 
 	glog.V(1).Infoln(md.Smd.Bucket, md.Smd.Name, r.ContentLength,
@@ -244,6 +353,7 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 
 	etagbyte := etag.Sum(nil)
 	md.Smd.Etag = hex.EncodeToString(etagbyte)
+	md.Data.DdBlocks = ddBlocks
 	return StatusOK, StatusOKStr
 }
 
