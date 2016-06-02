@@ -1,9 +1,13 @@
 package test
 
 import (
+	"encoding/xml"
+	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
 )
@@ -73,6 +77,108 @@ func (f *FileIO) DeleteBucket(bkname string) (status int, errmsg string) {
 		return InternalError, "failed to delete bucket"
 	}
 	return StatusOK, StatusOKStr
+}
+
+// The IOReader for object list
+type listObjectIOReader struct {
+	xmlbyte []byte
+	// the last read position
+	r int
+}
+
+func (l *listObjectIOReader) Close() error {
+	return nil
+}
+
+func (l *listObjectIOReader) Read(p []byte) (n int, err error) {
+	glog.V(4).Infoln("listObjectIOReader p len", len(p), "xmlbyte len", len(l.xmlbyte), l.r)
+
+	if l.r >= len(l.xmlbyte) {
+		// all readed, return 0 + EOF
+		return 0, io.EOF
+	}
+
+	t := l.r + len(p)
+	if t >= len(l.xmlbyte) {
+		copy(p, l.xmlbyte[l.r:])
+		t = len(l.xmlbyte) - l.r
+		l.r = len(l.xmlbyte)
+		return t, io.EOF
+	}
+
+	copy(p, l.xmlbyte[l.r:t])
+	l.r = t
+	return len(p), nil
+}
+
+// GetBucket lists objects in the bucket.
+// Only support the simple list
+func (f *FileIO) GetBucket(bkname string, resp *http.Response) {
+	type Content struct {
+		XMLName      xml.Name `xml:"Contents"`
+		Key          string   `xml:"Key"`
+		LastModified string   `xml:"LastModified"`
+		ETag         string   `xml:"ETag"`
+		Size         int64    `xml:"Size"`
+		StorageClass string   `xml:"StorageClass"`
+	}
+
+	type ListBucketResult struct {
+		XMLName     xml.Name  `xml:"ListBucketResult"`
+		Xmlns       string    `xml:"xmlns,attr"`
+		Name        string    `xml:"Name"`
+		Prefix      string    `xml:"Prefix"`
+		KeyCount    int       `xml:"KeyCount"`
+		MaxKeys     int       `xml:"MaxKeys"`
+		IsTruncated bool      `xml:"IsTruncated"`
+		Contents    []Content `xml:"Contents"`
+	}
+
+	dirpath := f.rootBucketDir + bkname
+	fd, err := os.Open(dirpath)
+	if err != nil {
+		glog.Errorln("failed to open bucket dir", dirpath, err)
+		resp.StatusCode = InternalError
+		resp.Status = InternalErrorStr
+		return
+	}
+
+	files, err := fd.Readdir(BucketListMaxKeys)
+	fd.Close()
+	if err != nil {
+		glog.Errorln("failed to read bucket dir", dirpath, err)
+		resp.StatusCode = InternalError
+		resp.Status = InternalErrorStr
+		return
+	}
+
+	glog.V(2).Infoln("list bucket dir, files", len(files), dirpath)
+
+	res := &ListBucketResult{Xmlns: XMLNS, Name: bkname, KeyCount: len(files),
+		MaxKeys: BucketListMaxKeys, IsTruncated: false}
+
+	for _, fi := range files {
+		c := Content{Key: fi.Name(), LastModified: fi.ModTime().Format(time.RFC3339),
+			ETag: "ETag", Size: fi.Size(), StorageClass: "STANDARD"}
+		res.Contents = append(res.Contents, c)
+	}
+
+	b, err := xml.Marshal(res)
+	if err != nil {
+		glog.Errorln("failed to marshal ListBucketResult", res, err)
+		resp.StatusCode = InternalError
+		resp.Status = InternalErrorStr
+		return
+	}
+
+	glog.V(4).Infoln("ListBucketResult", res)
+
+	rd := new(listObjectIOReader)
+	rd.xmlbyte = b
+
+	resp.Body = rd
+	resp.StatusCode = StatusOK
+	resp.Status = StatusOKStr
 }
 
 // IsDataBlockExist checks if the data block exists

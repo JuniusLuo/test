@@ -4,6 +4,7 @@ package test
 const (
 	// default read 128KB
 	ReadBufferSize = 131072
+	ServerName     = "CloudZzzz"
 )
 
 //const (
@@ -13,7 +14,21 @@ const (
 
 // S3 related operation definitions
 const (
-	BucketListOp = "/?list-type=2"
+	XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
+
+	BucketListMaxKeys    = 1000
+	BucketListOp         = "/?list-type=2"
+	BucketAccelerate     = "/?accelerate"
+	BucketCors           = "/?cors"
+	BucketLifecycle      = "/?lifecycle"
+	BucketPolicy         = "/?policy"
+	BucketLogging        = "/?logging"
+	BucketNotification   = "/?notification"
+	BucketReplication    = "/?replication"
+	BucketTag            = "/?tagging"
+	BucketRequestPayment = "/?requestPayment"
+	BucketVersioning     = "/?versioning"
+	BucketWebsite        = "/?website"
 )
 
 // S3 error code
@@ -26,6 +41,7 @@ const (
 	BucketNotEmpty               = 409
 	IncompleteBody               = 400
 	InternalError                = 500
+	InternalErrorStr             = "InternalError"
 	InvalidArgument              = 400
 	InvalidBucketName            = 400
 	InvalidDigest                = 400

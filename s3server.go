@@ -66,7 +66,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.StatusCode = InvalidRequest
 	}
 
-	glog.Flush()
+	resp.Header.Set("Date", time.Now().Format(time.RFC1123))
 
 	resp.Write(w)
 }
@@ -75,7 +75,10 @@ func (s *S3Server) newResponse() *http.Response {
 	resp := new(http.Response)
 	resp.ProtoMajor = 1
 	resp.ProtoMinor = 1
-	resp.StatusCode = StatusOK
+	resp.StatusCode = InvalidRequest
+	resp.Status = "not support request"
+	resp.Header = make(http.Header)
+	resp.Header.Set("Server", ServerName)
 	return resp
 }
 
@@ -110,13 +113,15 @@ func (s *S3Server) getBucketAndObjectName(r *http.Request) (bkname string, objna
 
 	if bkname == "" {
 		// path-style url, get bucket name and object name from URL
-		// url like /b1/k1 will be split to 3 elements, [ b1 k1]
+		// url like /b1/k1 will be split to 3 elements, [ b1 k1].
+		// /b1/ also 3 elements [ b1 ].
+		// /b1 2 elements [ b1].
 		strs := strings.SplitN(r.URL.String(), "/", 3)
 		l := len(strs)
 		if l == 3 {
 			return strs[1], "/" + strs[2]
 		} else if l == 2 {
-			return strs[1], ""
+			return strs[1], "/"
 		} else {
 			return "", ""
 		}
@@ -127,7 +132,8 @@ func (s *S3Server) getBucketAndObjectName(r *http.Request) (bkname string, objna
 }
 
 func (s *S3Server) isBucketOp(objname string) bool {
-	if objname == "" || objname == "/" || objname == BucketListOp {
+	if objname == "" || objname == "/" ||
+		strings.HasPrefix(objname, "/?") || strings.HasPrefix(objname, "?") {
 		return true
 	}
 	return false
@@ -135,8 +141,12 @@ func (s *S3Server) isBucketOp(objname string) bool {
 
 func (s *S3Server) putOp(r *http.Request, resp *http.Response, bkname string, objname string) {
 	if s.isBucketOp(objname) {
-		resp.StatusCode, resp.Status = s.s3io.PutBucket(bkname)
-		glog.Infoln("put bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+		if objname == "" || objname == "/" {
+			resp.StatusCode, resp.Status = s.s3io.PutBucket(bkname)
+			glog.Infoln("put bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+		} else {
+			glog.Errorln("not support put bucket operation", bkname, objname)
+		}
 	} else {
 		s.putObject(r, resp, bkname, objname)
 	}
@@ -243,9 +253,9 @@ func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash
 	if !s.s3io.IsDataBlockExist(md5str) {
 		res.exist = false
 		res.status, res.errmsg = s.s3io.WriteDataBlock(buf, md5str)
-		glog.V(2).Infoln("create data block", md5str, res.status)
+		glog.V(2).Infoln("create data block", md5str, res.status, len(buf))
 	} else {
-		glog.V(2).Infoln("data block exists", md5str)
+		glog.V(2).Infoln("data block exists", md5str, len(buf))
 	}
 
 	c <- res
@@ -404,15 +414,34 @@ func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string
 	}
 
 	glog.V(0).Infoln("successfully created object", bkname, objname, md.Smd.Etag)
+
+	resp.Header.Set("ETag", md.Smd.Etag)
+	resp.ContentLength = 0
+	resp.StatusCode = StatusOK
+	resp.Status = StatusOKStr
 }
 
 func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+	if s.isBucketOp(objname) {
+		if objname == "" || objname == "/" || objname == BucketListOp {
+			s.s3io.GetBucket(bkname, resp)
+		} else {
+			glog.Errorln("not support get bucket operation", bkname, objname)
+		}
+	} else {
+		glog.Errorln("not support yet")
+		//s.getObject(r, resp, bkname, objname)
+	}
 }
 
 func (s *S3Server) delOp(r *http.Request, resp *http.Response, bkname string, objname string) {
 	if s.isBucketOp(objname) {
-		resp.StatusCode, resp.Status = s.s3io.DeleteBucket(bkname)
-		glog.Infoln("del bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+		if objname == "" || objname == "/" {
+			resp.StatusCode, resp.Status = s.s3io.DeleteBucket(bkname)
+			glog.Infoln("del bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+		} else {
+			glog.Errorln("not support delete bucket operation", bkname, objname)
+		}
 	} else {
 		s.putObject(r, resp, bkname, objname)
 	}
