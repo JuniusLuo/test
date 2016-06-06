@@ -10,6 +10,8 @@ type CloudIO interface {
 
 	IsDataBlockExist(md5str string) bool
 	WriteDataBlock(buf []byte, md5str string) (status int, errmsg string)
+	ReadDataBlockRange(md5str string, off int64, b []byte) (n int, status int, errmsg string)
 
 	WriteObjectMD(bkname string, objname string, mdbuf []byte) (status int, errmsg string)
+	ReadObjectMD(bkname string, objname string) (b []byte, status int, errmsg string)
 }

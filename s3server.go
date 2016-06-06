@@ -3,6 +3,7 @@ package test
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"hash"
 	"io"
@@ -421,6 +422,46 @@ func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string
 	resp.Status = StatusOKStr
 }
 
+type objectDataIOReader struct {
+	s3io  CloudIO
+	objmd *ObjectMD
+	off   int64
+}
+
+func (d *objectDataIOReader) Close() error {
+	return nil
+}
+
+func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
+	if d.off >= d.objmd.Smd.Size {
+		glog.V(4).Infoln("finish read object", d.objmd.Smd)
+		return 0, io.EOF
+	}
+
+	// compute the corresponding data block and offset inside data block
+	idx := d.off / int64(d.objmd.Data.BlockSize)
+	blockOff := d.off % int64(d.objmd.Data.BlockSize)
+
+	// read the data block
+	n, status, errmsg := d.s3io.ReadDataBlockRange(d.objmd.Data.Blocks[idx], blockOff, p)
+
+	if status != StatusOK {
+		glog.Errorln("failed to read data block", d.objmd.Data.Blocks[idx], blockOff, d.off, d.objmd.Smd)
+		return n, errors.New(errmsg)
+	}
+
+	glog.V(4).Infoln("read data block", idx, d.objmd.Data.Blocks[idx], blockOff, n,
+		"object off", d.off, d.objmd.Smd)
+
+	d.off += int64(n)
+
+	if d.off == d.objmd.Smd.Size {
+		return n, io.EOF
+	}
+
+	return n, nil
+}
+
 func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		if objname == "" || objname == "/" || objname == BucketListOp {
@@ -429,8 +470,34 @@ func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, ob
 			glog.Errorln("not support get bucket operation", bkname, objname)
 		}
 	} else {
-		glog.Errorln("not support yet")
-		//s.getObject(r, resp, bkname, objname)
+		// read metadata object first
+		b, status, errmsg := s.s3io.ReadObjectMD(bkname, objname)
+		if status != StatusOK {
+			glog.Errorln("failed to ReadObjectMD", bkname, objname, status, errmsg)
+			resp.StatusCode = status
+			resp.Status = errmsg
+			return
+		}
+
+		objmd := &ObjectMD{}
+		err := proto.Unmarshal(b, objmd)
+		if err != nil {
+			glog.Errorln("failed to Unmarshal ObjectMD", bkname, objname, err)
+			resp.StatusCode = InternalError
+			resp.Status = InternalErrorStr
+			return
+		}
+
+		// read the corresponding data blocks
+		rd := new(objectDataIOReader)
+		rd.s3io = s.s3io
+		rd.objmd = objmd
+
+		resp.Body = rd
+		resp.StatusCode = StatusOK
+		resp.Status = StatusOKStr
+
+		glog.V(1).Infoln("successfully read object md", bkname, objname)
 	}
 }
 

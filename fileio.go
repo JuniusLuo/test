@@ -83,7 +83,7 @@ func (f *FileIO) DeleteBucket(bkname string) (status int, errmsg string) {
 type listObjectIOReader struct {
 	xmlbyte []byte
 	// the last read position
-	r int
+	off int
 }
 
 func (l *listObjectIOReader) Close() error {
@@ -91,23 +91,23 @@ func (l *listObjectIOReader) Close() error {
 }
 
 func (l *listObjectIOReader) Read(p []byte) (n int, err error) {
-	glog.V(4).Infoln("listObjectIOReader p len", len(p), "xmlbyte len", len(l.xmlbyte), l.r)
+	glog.V(4).Infoln("listObjectIOReader p len", len(p), "xmlbyte len", len(l.xmlbyte), l.off)
 
-	if l.r >= len(l.xmlbyte) {
+	if l.off >= len(l.xmlbyte) {
 		// all readed, return 0 + EOF
 		return 0, io.EOF
 	}
 
-	t := l.r + len(p)
+	t := l.off + len(p)
 	if t >= len(l.xmlbyte) {
-		copy(p, l.xmlbyte[l.r:])
-		t = len(l.xmlbyte) - l.r
-		l.r = len(l.xmlbyte)
+		copy(p, l.xmlbyte[l.off:])
+		t = len(l.xmlbyte) - l.off
+		l.off = len(l.xmlbyte)
 		return t, io.EOF
 	}
 
-	copy(p, l.xmlbyte[l.r:t])
-	l.r = t
+	copy(p, l.xmlbyte[l.off:t])
+	l.off = t
 	return len(p), nil
 }
 
@@ -212,4 +212,39 @@ func (f *FileIO) WriteObjectMD(bkname string, objname string, mdbuf []byte) (sta
 		return InternalError, "failed to create metadata file"
 	}
 	return StatusOK, StatusOKStr
+}
+
+// ReadObjectMD reads the metadata object
+func (f *FileIO) ReadObjectMD(bkname string, objname string) (b []byte, status int, errmsg string) {
+	glog.V(4).Infoln("read ObjectMD", bkname, objname)
+
+	fname := f.rootBucketDir + bkname + objname
+	b, err := ioutil.ReadFile(fname)
+	if err != nil {
+		glog.Errorln("failed to read metadata object file", fname, err)
+		return nil, InternalError, "failed to read metadata object file"
+	}
+
+	return b, StatusOK, StatusOKStr
+}
+
+// ReadDataBlockRange reads the data block
+func (f *FileIO) ReadDataBlockRange(md5str string, off int64, b []byte) (n int, status int, errmsg string) {
+	glog.V(4).Infoln("read data block", md5str, off, len(b))
+
+	fname := f.rootDataDir + md5str
+	fd, err := os.Open(fname)
+	if err != nil {
+		glog.Errorln("failed to open data block file", fname, err)
+		return 0, InternalError, "failed to open data block file"
+	}
+	defer fd.Close()
+
+	n, err = fd.ReadAt(b, off)
+	if err != nil && err != io.EOF {
+		glog.Errorln("failed to read data block file", fname, err)
+		return 0, InternalError, "failed to read data block file"
+	}
+
+	return n, StatusOK, StatusOKStr
 }
