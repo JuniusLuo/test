@@ -417,41 +417,152 @@ func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string
 	glog.V(0).Infoln("successfully created object", bkname, objname, md.Smd.Etag)
 
 	resp.Header.Set("ETag", md.Smd.Etag)
-	resp.ContentLength = 0
+	resp.ContentLength = md.Smd.Size
 	resp.StatusCode = StatusOK
 	resp.Status = StatusOKStr
 }
 
+type dataBlockReadResult struct {
+	blkIdx int
+	buf    []byte
+	n      int
+	status int
+	errmsg string
+}
+
 type objectDataIOReader struct {
+	resp  *http.Response
 	s3io  CloudIO
 	objmd *ObjectMD
 	off   int64
+	// the current cached data block
+	currBlock dataBlockReadResult
+	// channel to wait till the background prefetch complete
+	c chan dataBlockReadResult
+	// whether needs to wait for the outgoing prefetch
+	waitBlock bool
+}
+
+func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
+	res := dataBlockReadResult{blkIdx: blk, buf: b}
+
+	// sanity check
+	if blk >= len(d.objmd.Data.Blocks) {
+		glog.Errorln("no more block to read", blk, d.objmd)
+		res.status = InternalError
+		res.errmsg = "no more block to read"
+		return res
+	}
+
+	res.n, res.status, res.errmsg =
+		d.s3io.ReadDataBlockRange(d.objmd.Data.Blocks[blk], 0, res.buf)
+
+	glog.V(2).Infoln("read block done", blk, d.objmd.Data.Blocks[blk],
+		res.n, res.status, res.errmsg, d.objmd.Smd)
+
+	if res.status == StatusOK && res.n != int(d.objmd.Data.BlockSize) &&
+		res.blkIdx != len(d.objmd.Data.Blocks)-1 {
+		// read less data, could only happen for the last block
+		glog.Errorln("not read full block", res.n, blk, d.objmd)
+		res.status = InternalError
+		res.errmsg = "read less data for a full block"
+	}
+
+	return res
+}
+
+func (d *objectDataIOReader) prefetchBlock(blk int, b []byte) {
+	glog.V(5).Infoln("prefetchBlock start", blk, d.objmd.Smd)
+
+	d.c <- d.readBlock(blk, b)
+
+	glog.V(5).Infoln("prefetchBlock sent res to chan done", blk, d.objmd.Smd)
 }
 
 func (d *objectDataIOReader) Close() error {
+	// TODO further check the possible concurrent Close and Read.
+	// 		  need to make sure the prefetch go routine exits
+	glog.V(2).Infoln("objectDataIOReader close called", d.off, d.objmd.Smd.Size, d.waitBlock)
 	return nil
 }
 
 func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	if d.off >= d.objmd.Smd.Size {
-		glog.V(4).Infoln("finish read object", d.objmd.Smd)
+		glog.V(1).Infoln("finish read object data", d.objmd.Smd)
 		return 0, io.EOF
 	}
 
 	// compute the corresponding data block and offset inside data block
-	idx := d.off / int64(d.objmd.Data.BlockSize)
-	blockOff := d.off % int64(d.objmd.Data.BlockSize)
+	idx := int(d.off / int64(d.objmd.Data.BlockSize))
+	blockOff := int(d.off % int64(d.objmd.Data.BlockSize))
 
-	// read the data block
-	n, status, errmsg := d.s3io.ReadDataBlockRange(d.objmd.Data.Blocks[idx], blockOff, p)
-
-	if status != StatusOK {
-		glog.Errorln("failed to read data block", d.objmd.Data.Blocks[idx], blockOff, d.off, d.objmd.Smd)
-		return n, errors.New(errmsg)
+	if idx < d.currBlock.blkIdx {
+		// sanity check, this should not happen
+		glog.Errorln("read the previous data again?",
+			d.off, idx, d.currBlock.blkIdx, d.objmd.Smd)
+		d.resp.StatusCode = InvalidRequest
+		d.resp.Status = "read previous data again"
+		return 0, errors.New("Invalid read request, read previous data again")
 	}
 
-	glog.V(4).Infoln("read data block", idx, d.objmd.Data.Blocks[idx], blockOff, n,
-		"object off", d.off, d.objmd.Smd)
+	if idx > d.currBlock.blkIdx {
+		// sanity check, the prefetch task should be sent already
+		if !d.waitBlock {
+			glog.Errorln("no prefetch task", idx, d.off, d.objmd.Smd)
+			d.resp.StatusCode = InternalError
+			d.resp.Status = "no prefetch task"
+			return 0, errors.New("InternalError, no prefetch task")
+		}
+
+		glog.V(5).Infoln("wait the prefetch block", idx, d.off, d.objmd.Smd)
+
+		// current block is read out, wait for the next block
+		nextBlock := <-d.c
+		d.waitBlock = false
+
+		glog.V(5).Infoln("get the prefetch block", idx, d.off, d.objmd.Smd)
+
+		// the next block is back, switch the current block to the next block
+		oldbuf := d.currBlock.buf
+		d.currBlock = nextBlock
+
+		// prefetch the next block if necessary
+		if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
+			d.waitBlock = true
+			go d.prefetchBlock(d.currBlock.blkIdx+1, oldbuf)
+		}
+	}
+
+	// check the current block read status
+	if d.currBlock.status != StatusOK {
+		glog.Errorln("read data block failed", idx, d.objmd.Data.Blocks[idx],
+			d.off, d.currBlock.status, d.currBlock.errmsg, d.objmd.Smd)
+		d.resp.StatusCode = d.currBlock.status
+		d.resp.Status = d.currBlock.errmsg
+		return 0, errors.New(d.currBlock.errmsg)
+	}
+
+	// fill data from the current block
+	glog.V(2).Infoln("fill data from currBlock",
+		idx, blockOff, d.off, d.currBlock.n, d.objmd.Smd)
+
+	endOff := blockOff + len(p)
+	if endOff <= d.currBlock.n {
+		// currBlock has more data than p
+		glog.V(5).Infoln("currBlock has enough data",
+			idx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
+
+		copy(p, d.currBlock.buf[blockOff:endOff])
+		n = len(p)
+	} else {
+		// p could have more data than the rest in currBlock
+		// TODO copy the rest data from the next block
+		glog.V(5).Infoln("read the end of currBlock",
+			idx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
+
+		copy(p, d.currBlock.buf[blockOff:d.currBlock.n])
+		n = d.currBlock.n - blockOff
+	}
 
 	d.off += int64(n)
 
@@ -470,35 +581,69 @@ func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, ob
 			glog.Errorln("not support get bucket operation", bkname, objname)
 		}
 	} else {
-		// read metadata object first
-		b, status, errmsg := s.s3io.ReadObjectMD(bkname, objname)
-		if status != StatusOK {
-			glog.Errorln("failed to ReadObjectMD", bkname, objname, status, errmsg)
-			resp.StatusCode = status
-			resp.Status = errmsg
-			return
-		}
-
-		objmd := &ObjectMD{}
-		err := proto.Unmarshal(b, objmd)
-		if err != nil {
-			glog.Errorln("failed to Unmarshal ObjectMD", bkname, objname, err)
-			resp.StatusCode = InternalError
-			resp.Status = InternalErrorStr
-			return
-		}
-
-		// read the corresponding data blocks
-		rd := new(objectDataIOReader)
-		rd.s3io = s.s3io
-		rd.objmd = objmd
-
-		resp.Body = rd
-		resp.StatusCode = StatusOK
-		resp.Status = StatusOKStr
-
-		glog.V(1).Infoln("successfully read object md", bkname, objname)
+		s.getObjectOp(r, resp, bkname, objname)
 	}
+}
+
+func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+	// object get, read metadata object first
+	b, status, errmsg := s.s3io.ReadObjectMD(bkname, objname)
+	if status != StatusOK {
+		glog.Errorln("failed to ReadObjectMD", bkname, objname, status, errmsg)
+		resp.StatusCode = status
+		resp.Status = errmsg
+		return
+	}
+
+	objmd := &ObjectMD{}
+	err := proto.Unmarshal(b, objmd)
+	if err != nil {
+		glog.Errorln("failed to Unmarshal ObjectMD", bkname, objname, err)
+		resp.StatusCode = InternalError
+		resp.Status = InternalErrorStr
+		return
+	}
+
+	glog.V(2).Infoln("successfully read object md", bkname, objname)
+
+	resp.StatusCode = StatusOK
+	resp.Status = StatusOKStr
+	resp.ContentLength = objmd.Smd.Size
+
+	if objmd.Smd.Size == 0 {
+		glog.V(1).Infoln("successfully read 0 size object", bkname, objname)
+		return
+	}
+
+	// construct Body reader
+	// read the corresponding data blocks
+	rd := new(objectDataIOReader)
+	rd.resp = resp
+	rd.s3io = s.s3io
+	rd.objmd = objmd
+
+	// synchronously read the first block
+	b = make([]byte, objmd.Data.BlockSize)
+	rd.currBlock = rd.readBlock(0, b)
+
+	// check the first block read status
+	if rd.currBlock.status != StatusOK {
+		glog.Errorln("read first data block failed", objmd.Data.Blocks[0],
+			rd.currBlock.status, rd.currBlock.errmsg, bkname, objname)
+		resp.StatusCode = rd.currBlock.status
+		resp.Status = rd.currBlock.errmsg
+		return
+	}
+
+	// if there are more data to read, start the prefetch task
+	if objmd.Smd.Size > int64(objmd.Data.BlockSize) {
+		rd.c = make(chan dataBlockReadResult)
+		nextbuf := make([]byte, objmd.Data.BlockSize)
+		rd.waitBlock = true
+		go rd.prefetchBlock(1, nextbuf)
+	}
+
+	resp.Body = rd
 }
 
 func (s *S3Server) delOp(r *http.Request, resp *http.Response, bkname string, objname string) {

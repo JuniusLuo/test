@@ -10,10 +10,11 @@ import (
 
 // log level definitons:
 //	0 - enabled by default, just in case wants to disable
-//  1 - some more useful log
-//  2 - reserve
+//  1 - basic object operation log
+//  2 - object data read/write detail log
 //	3 - reserve
-//	4 - trace
+//	4 - reserve
+//	5 - trace
 func main() {
 
 	flag.Parse()
