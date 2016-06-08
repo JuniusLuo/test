@@ -8,6 +8,7 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -268,7 +269,10 @@ func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash
 	case c <- res:
 		glog.V(5).Infoln("sent writeDataBlockResult", md5str, md.Smd)
 	case <-quit:
-		glog.V(5).Infoln("writer quit", md.Smd)
+		glog.V(5).Infoln("write data block quit", md.Smd)
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("write data block timeout", md5str, md.Smd,
+			"NumGoroutine", runtime.NumGoroutine())
 	}
 }
 
@@ -302,10 +306,16 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 		glog.V(4).Infoln("read", n, err, "total readed len", rlen,
 			"specified read len", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
 
-		// hack to test quit writer
-		//if rlen > 2*ReadBufferSize {
-		//	err = io.EOF
-		//}
+		if RandomFI() {
+			glog.Errorln("FI at putObjectData", rlen, r.ContentLength, md.Smd,
+				"NumGoroutine", runtime.NumGoroutine())
+			if RandomFI() {
+				// test writer timeout to exit goroutine
+				return InternalError, "exit early to test chan timeout"
+			}
+			// test quit writer
+			err = io.EOF
+		}
 
 		if err != nil {
 			if err != io.EOF {
@@ -469,6 +479,8 @@ type objectDataIOReader struct {
 	// th2 may be at any step of Read(), th3 may call Close() at any time.
 	// channel to handle close on resp http exception
 	closed chan bool
+	// internal for FI usage only, to avoid close the chan multiple times
+	closeCalled bool
 }
 
 func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
@@ -502,25 +514,39 @@ func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
 func (d *objectDataIOReader) prefetchBlock(blk int, b []byte) {
 	glog.V(5).Infoln("prefetchBlock start", blk, d.objmd.Smd)
 
-	// hack: sleep here, so client could break the connection and Close() will
-	// be called, to test d.closed chan
-	//time.Sleep(2 * time.Second)
+	if RandomFI() {
+		// TODO how to let client receives error?
+		// simulate the connection broken and Close() is called
+		glog.Errorln("FI at prefetchBlock, close d.closed chan", blk, d.objmd.Smd)
+		d.closeChan()
+	}
 
 	res := d.readBlock(blk, b)
 	select {
-	case <-d.closed:
-		glog.Errorln("reader closed, stop prefetch block", blk, d.objmd.Smd)
 	case d.c <- res:
 		glog.V(5).Infoln("prefetchBlock sent res to chan done", blk, d.objmd.Smd)
+	case <-d.closed:
+		glog.Errorln("stop prefetchBlock, reader closed", blk, d.objmd.Smd)
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("stop prefetchBlock, timeout", blk, d.objmd.Smd)
 	}
 }
 
-func (d *objectDataIOReader) Close() error {
-	// TODO further check the possible concurrent Close and Read.
-	// 		  need to make sure the prefetch go routine exits
-	glog.V(2).Infoln("objectDataIOReader close called", d.off, d.objmd.Smd.Size, d.waitBlock)
+func (d *objectDataIOReader) closeChan() {
+	if FIEnabled() && d.closeCalled {
+		return
+	}
+
+	glog.V(5).Infoln("closeChan", d.off, d.objmd.Smd.Size)
+
 	// close the "closed" channel, so both prefetchBlock() and Read() can exit
 	close(d.closed)
+	d.closeCalled = true
+}
+
+func (d *objectDataIOReader) Close() error {
+	glog.V(2).Infoln("objectDataIOReader close called", d.off, d.objmd.Smd.Size)
+	d.closeChan()
 	return nil
 }
 
@@ -529,6 +555,8 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 		glog.V(1).Infoln("finish read object data", d.objmd.Smd)
 		return 0, io.EOF
 	}
+
+	// TODO setting resp.StatusCode here looks useless?
 
 	// compute the corresponding data block and offset inside data block
 	idx := int(d.off / int64(d.objmd.Data.BlockSize))
@@ -554,16 +582,15 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 
 		glog.V(5).Infoln("wait the prefetch block", idx, d.off, d.objmd.Smd)
 
-		// hack: sleep here, so client could break the connection and Close() will
-		// be called, to test d.closed chan
-		// Q: looks the ongoing Read still goes through, d.closed looks not used here.
-		// time.Sleep(2 * time.Second)
+		if RandomFI() {
+			// simulate the connection broken and Close() is called
+			// Q: looks the ongoing Read still goes through, d.closed looks not used here.
+			glog.Errorln("FI at Read, close d.closed chan", idx, d.off, d.objmd.Smd)
+			d.closeChan()
+		}
 
 		// current block is read out, wait for the next block
 		select {
-		case <-d.closed:
-			glog.Errorln("reader closed, stop Read", idx, d.off, d.objmd.Smd)
-			return 0, errors.New("connection closed by application")
 		case nextBlock := <-d.c:
 			d.waitBlock = false
 
@@ -578,6 +605,16 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 				d.waitBlock = true
 				go d.prefetchBlock(d.currBlock.blkIdx+1, oldbuf)
 			}
+		case <-d.closed:
+			glog.Errorln("stop Read, reader closed", idx, d.off, d.objmd.Smd)
+			d.resp.StatusCode = InternalError
+			d.resp.Status = "connection closed prematurely"
+			return 0, errors.New("connection closed prematurely")
+		case <-time.After(RWTimeOutSecs * time.Second):
+			glog.Errorln("stop Read, timeout", idx, d.off, d.objmd.Smd)
+			d.resp.StatusCode = InternalError
+			d.resp.Status = "internal read timeout"
+			return 0, errors.New("read timeout")
 		}
 	}
 
