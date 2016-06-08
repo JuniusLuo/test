@@ -69,7 +69,11 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp.Header.Set("Date", time.Now().Format(time.RFC1123))
 
-	resp.Write(w)
+	err := resp.Write(w)
+	if err != nil {
+		glog.Errorln("failed to write resp", r.Method, bkname, objname, err)
+		resp.Body.Close()
+	}
 }
 
 func (s *S3Server) newResponse() *http.Response {
@@ -237,7 +241,8 @@ type writeDataBlockResult struct {
 	errmsg string
 }
 
-func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash, c chan<- writeDataBlockResult) {
+func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash,
+	md *ObjectMD, c chan<- writeDataBlockResult, quit <-chan bool) {
 	// compute checksum
 	md5ck.Write(buf)
 	md5byte := md5ck.Sum(nil)
@@ -259,7 +264,12 @@ func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash
 		glog.V(2).Infoln("data block exists", md5str, len(buf))
 	}
 
-	c <- res
+	select {
+	case c <- res:
+		glog.V(5).Infoln("sent writeDataBlockResult", md5str, md.Smd)
+	case <-quit:
+		glog.V(5).Infoln("writer quit", md.Smd)
+	}
 }
 
 // read object data and create data blocks.
@@ -281,6 +291,7 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 
 	// chan to wait till the previous write completes
 	c := make(chan writeDataBlockResult)
+	quit := make(chan bool)
 	waitWrite := false
 
 	var rlen int64
@@ -291,10 +302,19 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 		glog.V(4).Infoln("read", n, err, "total readed len", rlen,
 			"specified read len", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
 
+		// hack to test quit writer
+		//if rlen > 2*ReadBufferSize {
+		//	err = io.EOF
+		//}
+
 		if err != nil {
 			if err != io.EOF {
 				glog.Errorln("failed to read data from http", err, "readed len", rlen,
 					"ContentLength", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+				if waitWrite {
+					glog.V(5).Infoln("notify writer to quit", md.Smd)
+					quit <- true
+				}
 				return InternalError, "failed to read data from http"
 			}
 
@@ -302,6 +322,10 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 			if rlen != r.ContentLength {
 				glog.Errorln("read", rlen, "less than ContentLength",
 					r.ContentLength, md.Smd.Bucket, md.Smd.Name)
+				if waitWrite {
+					glog.V(5).Infoln("notify writer to quit", md.Smd)
+					quit <- true
+				}
 				return InvalidRequest, "data less than ContentLength"
 			}
 
@@ -336,8 +360,8 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 		tmpbuf := readBuf
 		readBuf = writeBuf
 		writeBuf = tmpbuf
-		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag, c)
 		waitWrite = true
+		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag, md, c, quit)
 	}
 
 	// wait the last write
@@ -437,10 +461,14 @@ type objectDataIOReader struct {
 	off   int64
 	// the current cached data block
 	currBlock dataBlockReadResult
-	// channel to wait till the background prefetch complete
-	c chan dataBlockReadResult
 	// whether needs to wait for the outgoing prefetch
 	waitBlock bool
+	// channel to wait till the background prefetch complete
+	c chan dataBlockReadResult
+	// the reader is possible to involve 3 threads, th1 may be prefetching the block,
+	// th2 may be at any step of Read(), th3 may call Close() at any time.
+	// channel to handle close on resp http exception
+	closed chan bool
 }
 
 func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
@@ -474,15 +502,25 @@ func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
 func (d *objectDataIOReader) prefetchBlock(blk int, b []byte) {
 	glog.V(5).Infoln("prefetchBlock start", blk, d.objmd.Smd)
 
-	d.c <- d.readBlock(blk, b)
+	// hack: sleep here, so client could break the connection and Close() will
+	// be called, to test d.closed chan
+	//time.Sleep(2 * time.Second)
 
-	glog.V(5).Infoln("prefetchBlock sent res to chan done", blk, d.objmd.Smd)
+	res := d.readBlock(blk, b)
+	select {
+	case <-d.closed:
+		glog.Errorln("reader closed, stop prefetch block", blk, d.objmd.Smd)
+	case d.c <- res:
+		glog.V(5).Infoln("prefetchBlock sent res to chan done", blk, d.objmd.Smd)
+	}
 }
 
 func (d *objectDataIOReader) Close() error {
 	// TODO further check the possible concurrent Close and Read.
 	// 		  need to make sure the prefetch go routine exits
 	glog.V(2).Infoln("objectDataIOReader close called", d.off, d.objmd.Smd.Size, d.waitBlock)
+	// close the "closed" channel, so both prefetchBlock() and Read() can exit
+	close(d.closed)
 	return nil
 }
 
@@ -516,20 +554,30 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 
 		glog.V(5).Infoln("wait the prefetch block", idx, d.off, d.objmd.Smd)
 
+		// hack: sleep here, so client could break the connection and Close() will
+		// be called, to test d.closed chan
+		// Q: looks the ongoing Read still goes through, d.closed looks not used here.
+		// time.Sleep(2 * time.Second)
+
 		// current block is read out, wait for the next block
-		nextBlock := <-d.c
-		d.waitBlock = false
+		select {
+		case <-d.closed:
+			glog.Errorln("reader closed, stop Read", idx, d.off, d.objmd.Smd)
+			return 0, errors.New("connection closed by application")
+		case nextBlock := <-d.c:
+			d.waitBlock = false
 
-		glog.V(5).Infoln("get the prefetch block", idx, d.off, d.objmd.Smd)
+			glog.V(5).Infoln("get the prefetch block", idx, d.off, d.objmd.Smd)
 
-		// the next block is back, switch the current block to the next block
-		oldbuf := d.currBlock.buf
-		d.currBlock = nextBlock
+			// the next block is back, switch the current block to the next block
+			oldbuf := d.currBlock.buf
+			d.currBlock = nextBlock
 
-		// prefetch the next block if necessary
-		if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
-			d.waitBlock = true
-			go d.prefetchBlock(d.currBlock.blkIdx+1, oldbuf)
+			// prefetch the next block if necessary
+			if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
+				d.waitBlock = true
+				go d.prefetchBlock(d.currBlock.blkIdx+1, oldbuf)
+			}
 		}
 	}
 
@@ -621,6 +669,7 @@ func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname stri
 	rd.resp = resp
 	rd.s3io = s.s3io
 	rd.objmd = objmd
+	rd.closed = make(chan bool)
 
 	// synchronously read the first block
 	b = make([]byte, objmd.Data.BlockSize)

@@ -5,6 +5,8 @@ const (
 	// default read 128KB
 	ReadBufferSize = 131072
 	ServerName     = "CloudZzzz"
+	// 30s timeout for every single read/write operation
+	RWTimeOutSecs = 30
 )
 
 //const (
