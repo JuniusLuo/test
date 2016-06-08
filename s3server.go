@@ -60,6 +60,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET":
 		s.getOp(r, resp, bkname, objname)
 	case "HEAD":
+		s.headOp(r, resp, bkname, objname)
 	case "DELETE":
 		s.delOp(r, resp, bkname, objname)
 	case "OPTIONS":
@@ -371,6 +372,10 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 		readBuf = writeBuf
 		writeBuf = tmpbuf
 		waitWrite = true
+		// Note: should we switch to a single routine, which loops to write data
+		// block. and here invoke the routine via chan? assume go internally has
+		// like a queue for all routines, and one thread per core to schedule them.
+		// Sounds no big difference? an old routine + chan vs a new routine.
 		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag, md, c, quit)
 	}
 
@@ -743,4 +748,22 @@ func (s *S3Server) delOp(r *http.Request, resp *http.Response, bkname string, ob
 	} else {
 		s.putObject(r, resp, bkname, objname)
 	}
+}
+
+func (s *S3Server) headOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+	if s.isBucketOp(objname) {
+		if objname == "" || objname == "/" {
+			resp.StatusCode, resp.Status = s.s3io.HeadBucket(bkname)
+			glog.V(2).Infoln("head bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+		} else {
+			glog.Errorln("invalid head bucket operation", r.URL, r.Host, bkname)
+			resp.Status = "invalid head bucket operation"
+		}
+	} else {
+		s.headObject(r, resp, bkname, objname)
+	}
+}
+
+func (s *S3Server) headObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+
 }

@@ -79,6 +79,20 @@ func (f *FileIO) DeleteBucket(bkname string) (status int, errmsg string) {
 	return StatusOK, StatusOKStr
 }
 
+// HeadBucket checks bucket existence and permission
+func (f *FileIO) HeadBucket(bkname string) (status int, errmsg string) {
+	fname := f.rootBucketDir + bkname
+	_, err := os.Stat(fname)
+	if err != nil {
+		glog.Errorln("failed to stat bucket", fname, err)
+		if os.IsNotExist(err) {
+			return NoSuchBucket, "NoSuchBucket"
+		}
+		return InternalError, InternalErrorStr
+	}
+	return StatusOK, StatusOKStr
+}
+
 // The IOReader for object list
 type listObjectIOReader struct {
 	xmlbyte []byte
