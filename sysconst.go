@@ -31,6 +31,11 @@ const (
 	BucketRequestPayment = "/?requestPayment"
 	BucketVersioning     = "/?versioning"
 	BucketWebsite        = "/?website"
+
+	Server       = "Server"
+	Date         = "Date"
+	LastModified = "Last-Modified"
+	ETag         = "ETag"
 )
 
 // S3 error code

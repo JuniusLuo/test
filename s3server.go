@@ -69,7 +69,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		resp.StatusCode = InvalidRequest
 	}
 
-	resp.Header.Set("Date", time.Now().Format(time.RFC1123))
+	resp.Header.Set(Date, time.Now().Format(time.RFC1123))
 
 	err := resp.Write(w)
 	if err != nil {
@@ -85,7 +85,7 @@ func (s *S3Server) newResponse() *http.Response {
 	resp.StatusCode = InvalidRequest
 	resp.Status = "not support request"
 	resp.Header = make(http.Header)
-	resp.Header.Set("Server", ServerName)
+	resp.Header.Set(Server, ServerName)
 	return resp
 }
 
@@ -228,7 +228,7 @@ func (s *S3Server) putSmallObjectData(r *http.Request, md *ObjectMD) (status int
 	}
 
 	// add to data block
-	md.Data.BlockSize = int32(r.ContentLength)
+	md.Data.BlockSize = ReadBufferSize
 	md.Data.Blocks = append(md.Data.Blocks, md5str)
 
 	// set etag
@@ -455,8 +455,7 @@ func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string
 
 	glog.V(0).Infoln("successfully created object", bkname, objname, md.Smd.Etag)
 
-	resp.Header.Set("ETag", md.Smd.Etag)
-	resp.ContentLength = md.Smd.Size
+	resp.Header.Set(ETag, md.Smd.Etag)
 	resp.StatusCode = StatusOK
 	resp.Status = StatusOKStr
 }
@@ -675,29 +674,35 @@ func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, ob
 	}
 }
 
-func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) getObjectMD(bkname string, objname string) (objmd *ObjectMD, status int, errmsg string) {
 	// object get, read metadata object first
 	b, status, errmsg := s.s3io.ReadObjectMD(bkname, objname)
 	if status != StatusOK {
 		glog.Errorln("failed to ReadObjectMD", bkname, objname, status, errmsg)
-		resp.StatusCode = status
-		resp.Status = errmsg
-		return
+		return nil, status, errmsg
 	}
 
-	objmd := &ObjectMD{}
+	objmd = &ObjectMD{}
 	err := proto.Unmarshal(b, objmd)
 	if err != nil {
 		glog.Errorln("failed to Unmarshal ObjectMD", bkname, objname, err)
-		resp.StatusCode = InternalError
-		resp.Status = InternalErrorStr
-		return
+		return nil, InternalError, InternalErrorStr
 	}
 
 	glog.V(2).Infoln("successfully read object md", bkname, objname)
+	return objmd, StatusOK, StatusOKStr
+}
 
-	resp.StatusCode = StatusOK
-	resp.Status = StatusOKStr
+func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+	// object get, read metadata object
+	var objmd *ObjectMD
+	objmd, resp.StatusCode, resp.Status = s.getObjectMD(bkname, objname)
+	if resp.StatusCode != StatusOK {
+		glog.Errorln("getObjecct failed to get ObjectMD",
+			bkname, objname, resp.StatusCode, resp.Status)
+		return
+	}
+
 	resp.ContentLength = objmd.Smd.Size
 
 	if objmd.Smd.Size == 0 {
@@ -714,7 +719,7 @@ func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname stri
 	rd.closed = make(chan bool)
 
 	// synchronously read the first block
-	b = make([]byte, objmd.Data.BlockSize)
+	b := make([]byte, objmd.Data.BlockSize)
 	rd.currBlock = rd.readBlock(0, b)
 
 	// check the first block read status
@@ -765,5 +770,19 @@ func (s *S3Server) headOp(r *http.Request, resp *http.Response, bkname string, o
 }
 
 func (s *S3Server) headObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+	// get ObjectMD
+	var objmd *ObjectMD
+	objmd, resp.StatusCode, resp.Status = s.getObjectMD(bkname, objname)
+	if resp.StatusCode != StatusOK {
+		glog.Errorln("headObjecct failed to get ObjectMD",
+			bkname, objname, resp.StatusCode, resp.Status)
+		return
+	}
 
+	glog.V(2).Infoln("headObject", objmd.Smd)
+
+	// fill the response
+	resp.Header.Set(LastModified, time.Unix(objmd.Smd.Mtime, 0).Format(time.RFC1123))
+	resp.Header.Set(ETag, objmd.Smd.Etag)
+	resp.ContentLength = objmd.Smd.Size
 }
