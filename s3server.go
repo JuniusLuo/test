@@ -54,6 +54,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "POST":
+		http.Error(w, NotImplementedStr, NotImplemented)
 	case "PUT":
 		s.putOp(w, r, bkname, objname)
 	case "GET":
@@ -63,6 +64,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "DELETE":
 		s.delOp(w, r, bkname, objname)
 	case "OPTIONS":
+		http.Error(w, NotImplementedStr, NotImplemented)
 	default:
 		glog.Errorln("unsupported request", r.Method, r.URL)
 		http.Error(w, "Invalid method", InvalidRequest)
@@ -138,8 +140,8 @@ func (s *S3Server) putOp(w http.ResponseWriter, r *http.Request, bkname string, 
 			glog.Infoln("put bucket success", bkname)
 			w.WriteHeader(status)
 		} else {
-			glog.Errorln("not support put bucket operation", bkname, objname)
-			http.Error(w, "not support put bucket operation", InvalidRequest)
+			glog.Errorln("NotImplemented put bucket operation", bkname, objname)
+			http.Error(w, NotImplementedStr, NotImplemented)
 		}
 	} else {
 		s.putObject(w, r, bkname, objname)
@@ -651,7 +653,7 @@ func (s *S3Server) getOp(w http.ResponseWriter, r *http.Request, bkname string, 
 			}
 		} else {
 			glog.Errorln("not support get bucket operation", bkname, objname)
-			http.Error(w, "not supported get bucket operation", InvalidRequest)
+			http.Error(w, NotImplementedStr, NotImplemented)
 		}
 	} else {
 		s.getObjectOp(w, r, bkname, objname)
@@ -754,8 +756,8 @@ func (s *S3Server) delOp(w http.ResponseWriter, r *http.Request, bkname string, 
 			glog.Infoln("del bucket success", bkname)
 			w.WriteHeader(status)
 		} else {
-			glog.Errorln("not support delete bucket operation", bkname, objname)
-			http.Error(w, "not support delete bucket operation", InvalidRequest)
+			glog.Errorln("NotImplemented delete bucket operation", bkname, objname)
+			http.Error(w, NotImplementedStr, NotImplemented)
 		}
 	} else {
 		s.putObject(w, r, bkname, objname)
@@ -775,8 +777,8 @@ func (s *S3Server) headOp(w http.ResponseWriter, r *http.Request, bkname string,
 			glog.V(2).Infoln("head bucket success", bkname)
 			w.WriteHeader(status)
 		} else {
-			glog.Errorln("invalid head bucket operation", bkname, objname)
-			http.Error(w, "invalid head bucket operation", InvalidRequest)
+			glog.Errorln("Invalid head bucket operation", bkname, objname)
+			http.Error(w, "Invalid head bucket operation", InvalidRequest)
 		}
 	} else {
 		s.headObject(w, r, bkname, objname)

@@ -73,6 +73,8 @@ const (
 	NoSuchKey                    = 404
 	NoSuchLifecycleConfiguration = 404
 	NoSuchUpload                 = 404
+	NotImplemented               = 501
+	NotImplementedStr            = "NotImplemented"
 	OperationAborted             = 409
 	RequestTimeout               = 400
 	RequestTimeTooSkewed         = 403
