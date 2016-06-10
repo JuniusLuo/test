@@ -32,10 +32,12 @@ const (
 	BucketVersioning     = "/?versioning"
 	BucketWebsite        = "/?website"
 
-	Server       = "Server"
-	Date         = "Date"
-	LastModified = "Last-Modified"
-	ETag         = "ETag"
+	Server        = "Server"
+	Date          = "Date"
+	LastModified  = "Last-Modified"
+	ETag          = "ETag"
+	ContentLength = "Content-Length"
+	ContentType   = "Content-Type"
 )
 
 // S3 error code

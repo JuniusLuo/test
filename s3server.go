@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,53 +41,32 @@ func NewS3Server() *S3Server {
 }
 
 func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	resp := s.newResponse()
 	bkname, objname := s.getBucketAndObjectName(r)
-
 	glog.V(2).Infoln(r.Method, r.URL, r.Host, bkname, objname)
+
+	w.Header().Set(Server, ServerName)
 
 	if bkname == "" {
 		glog.Errorln("InvalidRequest, no bucketname", r.Method, r.URL, r.Host)
-		resp.StatusCode = InvalidRequest
-		resp.Status = "InvalidRequest, no bucketname"
-		resp.Write(w)
+		http.Error(w, "InvalidRequest, no bucketname", InvalidRequest)
 		return
 	}
 
 	switch r.Method {
 	case "POST":
 	case "PUT":
-		s.putOp(r, resp, bkname, objname)
+		s.putOp(w, r, bkname, objname)
 	case "GET":
-		s.getOp(r, resp, bkname, objname)
+		s.getOp(w, r, bkname, objname)
 	case "HEAD":
-		s.headOp(r, resp, bkname, objname)
+		s.headOp(w, r, bkname, objname)
 	case "DELETE":
-		s.delOp(r, resp, bkname, objname)
+		s.delOp(w, r, bkname, objname)
 	case "OPTIONS":
 	default:
 		glog.Errorln("unsupported request", r.Method, r.URL)
-		resp.StatusCode = InvalidRequest
+		http.Error(w, "Invalid method", InvalidRequest)
 	}
-
-	resp.Header.Set(Date, time.Now().Format(time.RFC1123))
-
-	err := resp.Write(w)
-	if err != nil {
-		glog.Errorln("failed to write resp", r.Method, bkname, objname, err)
-		resp.Body.Close()
-	}
-}
-
-func (s *S3Server) newResponse() *http.Response {
-	resp := new(http.Response)
-	resp.ProtoMajor = 1
-	resp.ProtoMinor = 1
-	resp.StatusCode = InvalidRequest
-	resp.Status = "not support request"
-	resp.Header = make(http.Header)
-	resp.Header.Set(Server, ServerName)
-	return resp
 }
 
 // S3 supports 2 types url.
@@ -146,16 +126,23 @@ func (s *S3Server) isBucketOp(objname string) bool {
 	return false
 }
 
-func (s *S3Server) putOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) putOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		if objname == "" || objname == "/" {
-			resp.StatusCode, resp.Status = s.s3io.PutBucket(bkname)
-			glog.Infoln("put bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+			status, errmsg := s.s3io.PutBucket(bkname)
+			if status != StatusOK {
+				glog.Errorln("put bucket failed", bkname, status, errmsg)
+				http.Error(w, errmsg, status)
+				return
+			}
+			glog.Infoln("put bucket success", bkname)
+			w.WriteHeader(status)
 		} else {
 			glog.Errorln("not support put bucket operation", bkname, objname)
+			http.Error(w, "not support put bucket operation", InvalidRequest)
 		}
 	} else {
-		s.putObject(r, resp, bkname, objname)
+		s.putObject(w, r, bkname, objname)
 	}
 }
 
@@ -307,7 +294,7 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 		glog.V(4).Infoln("read", n, err, "total readed len", rlen,
 			"specified read len", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
 
-		if RandomFI() {
+		if RandomFI() && !FIRandomSleep() {
 			glog.Errorln("FI at putObjectData", rlen, r.ContentLength, md.Smd,
 				"NumGoroutine", runtime.NumGoroutine())
 			if RandomFI() {
@@ -407,7 +394,7 @@ func (s *S3Server) putObjectData(r *http.Request, md *ObjectMD) (status int, err
 	return StatusOK, StatusOKStr
 }
 
-func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	// Performance is one critical factor for this dedup layer. Not doing the
 	// additional operations here, such as bucket permission check, etc.
 	// When creating the metadata object, S3 will do all the checks. If S3
@@ -431,33 +418,31 @@ func (s *S3Server) putObject(r *http.Request, resp *http.Response, bkname string
 	// read object data and create data blocks
 	status, errmsg := s.putObjectData(r, md)
 	if status != StatusOK {
-		resp.StatusCode = status
-		resp.Status = errmsg
+		glog.Errorln("put object failed", bkname, objname, status, errmsg)
+		http.Error(w, errmsg, status)
 		return
 	}
 
 	// Marshal ObjectMD to []byte
 	mdbyte, err := proto.Marshal(md)
 	if err != nil {
-		glog.Errorln("failed to Marshal ObjectMD", md, err)
-		resp.StatusCode = InternalError
-		resp.Status = "failed to Marshal ObjectMD"
+		glog.Errorln("failed to marshal ObjectMD", bkname, objname, md, err)
+		http.Error(w, "failed to marshal ObjectMD", InternalError)
 		return
 	}
 
 	// write out ObjectMD
 	status, errmsg = s.s3io.WriteObjectMD(bkname, objname, mdbyte)
 	if status != StatusOK {
-		resp.StatusCode = status
-		resp.Status = errmsg
+		glog.Errorln("failed to write ObjectMD", bkname, objname, status, errmsg)
+		http.Error(w, errmsg, status)
 		return
 	}
 
-	glog.V(0).Infoln("successfully created object", bkname, objname, md.Smd.Etag)
+	glog.V(0).Infoln("create object success", bkname, objname, md.Smd.Etag)
 
-	resp.Header.Set(ETag, md.Smd.Etag)
-	resp.StatusCode = StatusOK
-	resp.Status = StatusOKStr
+	w.Header().Set(ETag, md.Smd.Etag)
+	w.WriteHeader(status)
 }
 
 type dataBlockReadResult struct {
@@ -469,19 +454,18 @@ type dataBlockReadResult struct {
 }
 
 type objectDataIOReader struct {
-	resp  *http.Response
+	w     http.ResponseWriter
 	s3io  CloudIO
 	objmd *ObjectMD
 	off   int64
 	// the current cached data block
 	currBlock dataBlockReadResult
-	// whether needs to wait for the outgoing prefetch
+	// sanity check, whether needs to wait for the outgoing prefetch
 	waitBlock bool
 	// channel to wait till the background prefetch complete
 	c chan dataBlockReadResult
-	// the reader is possible to involve 3 threads, th1 may be prefetching the block,
-	// th2 may be at any step of Read(), th3 may call Close() at any time.
-	// channel to handle close on resp http exception
+	// the reader is possible to involve 2 threads, th1 may be prefetching the block,
+	// th2 may be at any step of Read()
 	closed chan bool
 	// internal for FI usage only, to avoid close the chan multiple times
 	closeCalled bool
@@ -518,9 +502,8 @@ func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
 func (d *objectDataIOReader) prefetchBlock(blk int, b []byte) {
 	glog.V(5).Infoln("prefetchBlock start", blk, d.objmd.Smd)
 
-	if RandomFI() {
-		// TODO how to let client receives error?
-		// simulate the connection broken and Close() is called
+	if RandomFI() && !FIRandomSleep() {
+		// simulate the connection broken and closeChan() is called
 		glog.Errorln("FI at prefetchBlock, close d.closed chan", blk, d.objmd.Smd)
 		d.closeChan()
 	}
@@ -548,19 +531,11 @@ func (d *objectDataIOReader) closeChan() {
 	d.closeCalled = true
 }
 
-func (d *objectDataIOReader) Close() error {
-	glog.V(2).Infoln("objectDataIOReader close called", d.off, d.objmd.Smd.Size)
-	d.closeChan()
-	return nil
-}
-
 func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	if d.off >= d.objmd.Smd.Size {
 		glog.V(1).Infoln("finish read object data", d.objmd.Smd)
 		return 0, io.EOF
 	}
-
-	// TODO setting resp.StatusCode here looks useless?
 
 	// compute the corresponding data block and offset inside data block
 	idx := int(d.off / int64(d.objmd.Data.BlockSize))
@@ -570,8 +545,6 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 		// sanity check, this should not happen
 		glog.Errorln("read the previous data again?",
 			d.off, idx, d.currBlock.blkIdx, d.objmd.Smd)
-		d.resp.StatusCode = InvalidRequest
-		d.resp.Status = "read previous data again"
 		return 0, errors.New("Invalid read request, read previous data again")
 	}
 
@@ -579,14 +552,12 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 		// sanity check, the prefetch task should be sent already
 		if !d.waitBlock {
 			glog.Errorln("no prefetch task", idx, d.off, d.objmd.Smd)
-			d.resp.StatusCode = InternalError
-			d.resp.Status = "no prefetch task"
 			return 0, errors.New("InternalError, no prefetch task")
 		}
 
 		glog.V(5).Infoln("wait the prefetch block", idx, d.off, d.objmd.Smd)
 
-		if RandomFI() {
+		if RandomFI() && !FIRandomSleep() {
 			// simulate the connection broken and Close() is called
 			// Q: looks the ongoing Read still goes through, d.closed looks not used here.
 			glog.Errorln("FI at Read, close d.closed chan", idx, d.off, d.objmd.Smd)
@@ -611,13 +582,9 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 			}
 		case <-d.closed:
 			glog.Errorln("stop Read, reader closed", idx, d.off, d.objmd.Smd)
-			d.resp.StatusCode = InternalError
-			d.resp.Status = "connection closed prematurely"
-			return 0, errors.New("connection closed prematurely")
+			return 0, errors.New("connection closed")
 		case <-time.After(RWTimeOutSecs * time.Second):
 			glog.Errorln("stop Read, timeout", idx, d.off, d.objmd.Smd)
-			d.resp.StatusCode = InternalError
-			d.resp.Status = "internal read timeout"
 			return 0, errors.New("read timeout")
 		}
 	}
@@ -626,8 +593,6 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	if d.currBlock.status != StatusOK {
 		glog.Errorln("read data block failed", idx, d.objmd.Data.Blocks[idx],
 			d.off, d.currBlock.status, d.currBlock.errmsg, d.objmd.Smd)
-		d.resp.StatusCode = d.currBlock.status
-		d.resp.Status = d.currBlock.errmsg
 		return 0, errors.New(d.currBlock.errmsg)
 	}
 
@@ -662,15 +627,31 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
-func (s *S3Server) getOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) getOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		if objname == "" || objname == "/" || objname == BucketListOp {
-			s.s3io.GetBucket(bkname, resp)
+			body, status, errmsg := s.s3io.GetBucket(bkname)
+			if status != StatusOK {
+				glog.Errorln("get bucket failed", bkname, objname, status, errmsg)
+				http.Error(w, errmsg, status)
+				return
+			}
+
+			// GetBucket success, copy result to w
+			_, err := io.Copy(w, body)
+			if err != nil {
+				if err == io.EOF {
+					glog.V(5).Infoln("get bucket success", bkname, objname)
+				} else {
+					glog.Errorln("get bucket failed", bkname, objname, err)
+				}
+			}
 		} else {
 			glog.Errorln("not support get bucket operation", bkname, objname)
+			http.Error(w, "not supported get bucket operation", InvalidRequest)
 		}
 	} else {
-		s.getObjectOp(r, resp, bkname, objname)
+		s.getObjectOp(w, r, bkname, objname)
 	}
 }
 
@@ -689,31 +670,34 @@ func (s *S3Server) getObjectMD(bkname string, objname string) (objmd *ObjectMD, 
 		return nil, InternalError, InternalErrorStr
 	}
 
-	glog.V(2).Infoln("successfully read object md", bkname, objname)
+	glog.V(2).Infoln("successfully read object md", bkname, objname, objmd.Smd)
 	return objmd, StatusOK, StatusOKStr
 }
 
-func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) getObjectOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	// object get, read metadata object
-	var objmd *ObjectMD
-	objmd, resp.StatusCode, resp.Status = s.getObjectMD(bkname, objname)
-	if resp.StatusCode != StatusOK {
+	objmd, status, errmsg := s.getObjectMD(bkname, objname)
+	if status != StatusOK {
 		glog.Errorln("getObjecct failed to get ObjectMD",
-			bkname, objname, resp.StatusCode, resp.Status)
+			bkname, objname, status, errmsg)
+		http.Error(w, errmsg, status)
 		return
 	}
 
-	resp.ContentLength = objmd.Smd.Size
+	w.Header().Set(LastModified, time.Unix(objmd.Smd.Mtime, 0).UTC().Format(time.RFC1123))
+	w.Header().Set(ETag, objmd.Smd.Etag)
+	w.Header().Set(ContentLength, strconv.FormatInt(objmd.Smd.Size, 10))
 
 	if objmd.Smd.Size == 0 {
 		glog.V(1).Infoln("successfully read 0 size object", bkname, objname)
+		w.WriteHeader(status)
 		return
 	}
 
 	// construct Body reader
 	// read the corresponding data blocks
 	rd := new(objectDataIOReader)
-	rd.resp = resp
+	rd.w = w
 	rd.s3io = s.s3io
 	rd.objmd = objmd
 	rd.closed = make(chan bool)
@@ -726,8 +710,7 @@ func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname stri
 	if rd.currBlock.status != StatusOK {
 		glog.Errorln("read first data block failed", objmd.Data.Blocks[0],
 			rd.currBlock.status, rd.currBlock.errmsg, bkname, objname)
-		resp.StatusCode = rd.currBlock.status
-		resp.Status = rd.currBlock.errmsg
+		http.Error(w, rd.currBlock.errmsg, rd.currBlock.status)
 		return
 	}
 
@@ -739,50 +722,73 @@ func (s *S3Server) getObjectOp(r *http.Request, resp *http.Response, bkname stri
 		go rd.prefetchBlock(1, nextbuf)
 	}
 
-	resp.Body = rd
+	_, err := io.Copy(w, rd)
+	if err != nil {
+		if err == io.EOF {
+			glog.V(5).Infoln("read success", bkname, objname)
+		} else {
+			glog.Errorln("read failed", bkname, objname, err)
+		}
+	}
+
+	// read done, close reader
+	rd.closeChan()
 }
 
-func (s *S3Server) delOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) delOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		if objname == "" || objname == "/" {
-			resp.StatusCode, resp.Status = s.s3io.DeleteBucket(bkname)
-			glog.Infoln("del bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+			status, errmsg := s.s3io.DeleteBucket(bkname)
+			if status != StatusOK {
+				glog.Errorln("delete bucket failed", bkname, status, errmsg)
+				http.Error(w, errmsg, status)
+				return
+			}
+			glog.Infoln("del bucket success", bkname)
+			w.WriteHeader(status)
 		} else {
 			glog.Errorln("not support delete bucket operation", bkname, objname)
+			http.Error(w, "not support delete bucket operation", InvalidRequest)
 		}
 	} else {
-		s.putObject(r, resp, bkname, objname)
+		s.putObject(w, r, bkname, objname)
 	}
 }
 
-func (s *S3Server) headOp(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) headOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	if s.isBucketOp(objname) {
 		if objname == "" || objname == "/" {
-			resp.StatusCode, resp.Status = s.s3io.HeadBucket(bkname)
-			glog.V(2).Infoln("head bucket", r.URL, r.Host, bkname, resp.StatusCode, resp.Status)
+			status, errmsg := s.s3io.HeadBucket(bkname)
+			if status != StatusOK {
+				glog.Errorln("failed to head bucket", bkname, status, errmsg)
+				http.Error(w, errmsg, status)
+				return
+			}
+
+			glog.V(2).Infoln("head bucket success", bkname)
+			w.WriteHeader(status)
 		} else {
-			glog.Errorln("invalid head bucket operation", r.URL, r.Host, bkname)
-			resp.Status = "invalid head bucket operation"
+			glog.Errorln("invalid head bucket operation", bkname, objname)
+			http.Error(w, "invalid head bucket operation", InvalidRequest)
 		}
 	} else {
-		s.headObject(r, resp, bkname, objname)
+		s.headObject(w, r, bkname, objname)
 	}
 }
 
-func (s *S3Server) headObject(r *http.Request, resp *http.Response, bkname string, objname string) {
+func (s *S3Server) headObject(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
 	// get ObjectMD
-	var objmd *ObjectMD
-	objmd, resp.StatusCode, resp.Status = s.getObjectMD(bkname, objname)
-	if resp.StatusCode != StatusOK {
+	objmd, status, errmsg := s.getObjectMD(bkname, objname)
+	if status != StatusOK {
 		glog.Errorln("headObjecct failed to get ObjectMD",
-			bkname, objname, resp.StatusCode, resp.Status)
+			bkname, objname, status, errmsg)
+		http.Error(w, errmsg, status)
 		return
 	}
 
-	glog.V(2).Infoln("headObject", objmd.Smd)
+	glog.V(2).Infoln("head object success", objmd.Smd)
 
-	// fill the response
-	resp.Header.Set(LastModified, time.Unix(objmd.Smd.Mtime, 0).Format(time.RFC1123))
-	resp.Header.Set(ETag, objmd.Smd.Etag)
-	resp.ContentLength = objmd.Smd.Size
+	w.Header().Set(LastModified, time.Unix(objmd.Smd.Mtime, 0).UTC().Format(time.RFC1123))
+	w.Header().Set(ETag, objmd.Smd.Etag)
+	w.WriteHeader(StatusOK)
 }

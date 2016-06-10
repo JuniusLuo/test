@@ -1,12 +1,12 @@
 package test
 
-import "net/http"
+import "io"
 
 // CloudIO defines the ioengine interfaces
 type CloudIO interface {
 	PutBucket(bkname string) (status int, errmsg string)
 	DeleteBucket(bkname string) (status int, errmsg string)
-	GetBucket(bkname string, resp *http.Response)
+	GetBucket(bkname string) (body io.Reader, status int, errmsg string)
 	HeadBucket(bkname string) (status int, errmsg string)
 
 	IsDataBlockExist(md5str string) bool

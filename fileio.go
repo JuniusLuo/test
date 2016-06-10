@@ -4,7 +4,6 @@ import (
 	"encoding/xml"
 	"io"
 	"io/ioutil"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -100,10 +99,6 @@ type listObjectIOReader struct {
 	off int
 }
 
-func (l *listObjectIOReader) Close() error {
-	return nil
-}
-
 func (l *listObjectIOReader) Read(p []byte) (n int, err error) {
 	glog.V(4).Infoln("listObjectIOReader p len", len(p), "xmlbyte len", len(l.xmlbyte), l.off)
 
@@ -127,7 +122,7 @@ func (l *listObjectIOReader) Read(p []byte) (n int, err error) {
 
 // GetBucket lists objects in the bucket.
 // Only support the simple list
-func (f *FileIO) GetBucket(bkname string, resp *http.Response) {
+func (f *FileIO) GetBucket(bkname string) (body io.Reader, status int, errmsg string) {
 	type Content struct {
 		XMLName      xml.Name `xml:"Contents"`
 		Key          string   `xml:"Key"`
@@ -152,18 +147,14 @@ func (f *FileIO) GetBucket(bkname string, resp *http.Response) {
 	fd, err := os.Open(dirpath)
 	if err != nil {
 		glog.Errorln("failed to open bucket dir", dirpath, err)
-		resp.StatusCode = InternalError
-		resp.Status = InternalErrorStr
-		return
+		return nil, InternalError, InternalErrorStr
 	}
 
 	files, err := fd.Readdir(BucketListMaxKeys)
 	fd.Close()
 	if err != nil {
 		glog.Errorln("failed to read bucket dir", dirpath, err)
-		resp.StatusCode = InternalError
-		resp.Status = InternalErrorStr
-		return
+		return nil, InternalError, InternalErrorStr
 	}
 
 	glog.V(2).Infoln("list bucket dir, files", len(files), dirpath)
@@ -179,10 +170,8 @@ func (f *FileIO) GetBucket(bkname string, resp *http.Response) {
 
 	b, err := xml.Marshal(res)
 	if err != nil {
-		glog.Errorln("failed to marshal ListBucketResult", res, err)
-		resp.StatusCode = InternalError
-		resp.Status = InternalErrorStr
-		return
+		glog.Errorln("failed to marshal ListBucketResult", dirpath, res, err)
+		return nil, InternalError, InternalErrorStr
 	}
 
 	glog.V(4).Infoln("ListBucketResult", res)
@@ -190,9 +179,7 @@ func (f *FileIO) GetBucket(bkname string, resp *http.Response) {
 	rd := new(listObjectIOReader)
 	rd.xmlbyte = b
 
-	resp.Body = rd
-	resp.StatusCode = StatusOK
-	resp.Status = StatusOKStr
+	return rd, StatusOK, StatusOKStr
 }
 
 // IsDataBlockExist checks if the data block exists
@@ -236,6 +223,9 @@ func (f *FileIO) ReadObjectMD(bkname string, objname string) (b []byte, status i
 	b, err := ioutil.ReadFile(fname)
 	if err != nil {
 		glog.Errorln("failed to read metadata object file", fname, err)
+		if os.IsNotExist(err) {
+			return nil, NoSuchKey, "NoSuchKey"
+		}
 		return nil, InternalError, "failed to read metadata object file"
 	}
 
