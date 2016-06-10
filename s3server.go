@@ -638,13 +638,16 @@ func (s *S3Server) getOp(w http.ResponseWriter, r *http.Request, bkname string, 
 			}
 
 			// GetBucket success, copy result to w
-			_, err := io.Copy(w, body)
-			if err != nil {
-				if err == io.EOF {
-					glog.V(5).Infoln("get bucket success", bkname, objname)
-				} else {
-					glog.Errorln("get bucket failed", bkname, objname, err)
+			n, err := io.Copy(w, body)
+			if err != nil || n == 0 {
+				glog.Errorln("get bucket failed", bkname, objname, n, err)
+				if n == 0 {
+					// n == 0 is not valid, the list would at least have some xml string
+					// read and write 0 data, w.Write may not be called in io.Copy
+					w.WriteHeader(InternalError)
 				}
+			} else {
+				glog.V(1).Infoln("get bucket success", bkname, objname, n)
 			}
 		} else {
 			glog.Errorln("not support get bucket operation", bkname, objname)
@@ -689,7 +692,7 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, r *http.Request, bkname st
 	w.Header().Set(ContentLength, strconv.FormatInt(objmd.Smd.Size, 10))
 
 	if objmd.Smd.Size == 0 {
-		glog.V(1).Infoln("successfully read 0 size object", bkname, objname)
+		glog.V(1).Infoln("get object success, size 0", bkname, objname)
 		w.WriteHeader(status)
 		return
 	}
@@ -722,13 +725,17 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, r *http.Request, bkname st
 		go rd.prefetchBlock(1, nextbuf)
 	}
 
-	_, err := io.Copy(w, rd)
-	if err != nil {
-		if err == io.EOF {
-			glog.V(5).Infoln("read success", bkname, objname)
-		} else {
-			glog.Errorln("read failed", bkname, objname, err)
+	n, err := io.Copy(w, rd)
+	if err != nil || n == 0 {
+		// n == 0 is also an error,
+		glog.Errorln("get object failed", bkname, objname, n, err)
+		if n == 0 {
+			// n == 0 is also an error. if object size is 0, will not reach here.
+			// read and write 0 data, w.Write may not be called in io.Copy
+			w.WriteHeader(InternalError)
 		}
+	} else {
+		glog.V(1).Infoln("get object success", bkname, objname, n, objmd.Smd)
 	}
 
 	// read done, close reader
