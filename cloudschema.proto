@@ -20,6 +20,29 @@ message ObjectSMD {
   string etag = 5;
 }
 
+message Acl {
+
+}
+
+message ObjectUMD {
+  string key = 1;
+  string strval = 2;
+  string byteval = 3;
+}
+
+// md5 is 32 bytes. if data block is 128KB, 128MB object has 1k blocks, 32KB.
+// 512MB object has 4k blocks, 128KB. 128GB object has 1m blocks, 32MB.
+// 1TB object has 8m bloks, 256MB. 4TB object has 32m blocks, 1GB.
+// So we need the ability to split the blocks.
+// 1. split meta object to multiple objects, such as /b1/k1.md.1, k1.md.2, etc.
+//    needs to handle the object name actually exist. For example, k1.md is a real
+//    object name. The meta object of k1.md will be k1.md.md.1.
+// 2. keep a single meta object. The problem becomes how to deserialize.
+//    we have to have a small meta gpb with fixed size. Then append the split blocks.
+// 3. unify with MPU. We could split the blocks to parts. The first 64k blocks 2MB
+//    will be stored directly in the meta object with other metadata.
+//
+// #3 is best.
 message DataBlock {
   // data block size, such as 128KB
   int32 blockSize = 1;
@@ -31,8 +54,27 @@ message DataBlock {
   repeated string blocks = 3;
 }
 
+// Compress it before store to cloud. Compress would help a lot for many md5 strings.
 message ObjectMD {
+  // SMD is the minimal set of system metadata
   ObjectSMD smd = 1;
-  DataBlock data = 2;
+  Acl acl = 2;
+  ObjectUMD umd = 3;
+
+  DataBlock data = 4;
+  // every data part will store one DataBlock
+  repeated string dataParts = 5;
+}
+
+// the positive and negative refs for one block.
+// the ref is key name to allow inserting the same ref again.
+// what if there are huge refs to one block? assume key name is 512 bytes,
+// if one block is refed by 1k keys 512KB, 1m keys 512MB.
+// similar with data block, could have like md5.rr.1, md5.rr.2
+message BlockRefs {
+  repeated string pref = 1;
+  repeated string nref = 2;
+  // if there are more refs parts
+  repeated string refParts = 3;
 }
 // [END messages]

@@ -92,7 +92,7 @@ func (s *S3Server) getBucketFromHost(host string) (bkname string) {
 		return ""
 	}
 
-	// TODO invalid URL?
+	glog.Errorln("invalid url", host)
 	return ""
 }
 
@@ -762,6 +762,14 @@ func (s *S3Server) delOp(w http.ResponseWriter, r *http.Request, bkname string, 
 	} else {
 		s.putObject(w, r, bkname, objname)
 	}
+}
+
+func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
+	// read object md
+
+	// log it to the local fs (protected by EBS or the underline storage of VMWare)
+
+	// return success, the background scanner will pick up from log
 }
 
 func (s *S3Server) headOp(w http.ResponseWriter, r *http.Request, bkname string, objname string) {
