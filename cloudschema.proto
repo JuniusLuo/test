@@ -56,14 +56,16 @@ message DataBlock {
 
 // Compress it before store to cloud. Compress would help a lot for many md5 strings.
 message ObjectMD {
+  // uuid for object put, to handle the possible concurrent puts for the same object.
+  string uuid = 1;
   // SMD is the minimal set of system metadata
-  ObjectSMD smd = 1;
-  Acl acl = 2;
-  ObjectUMD umd = 3;
+  ObjectSMD smd = 2;
+  Acl acl = 3;
+  ObjectUMD umd = 4;
 
-  DataBlock data = 4;
+  DataBlock data = 5;
   // every data part will store one DataBlock
-  repeated string dataParts = 5;
+  repeated string dataParts = 6;
 }
 
 // the positive and negative refs for one block.

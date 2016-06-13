@@ -4,7 +4,6 @@ package test
 const (
 	// default read 128KB
 	ReadBufferSize = 131072
-	ServerName     = "CloudZzzz"
 	// 30s timeout for every single read/write operation
 	RWTimeOutSecs = 30
 )
@@ -32,6 +31,8 @@ const (
 	BucketVersioning     = "/?versioning"
 	BucketWebsite        = "/?website"
 
+	RequestID     = "x-request-id"
+	ServerName    = "CloudZzzz"
 	Server        = "Server"
 	Date          = "Date"
 	LastModified  = "Last-Modified"
