@@ -54,7 +54,6 @@ message DataBlock {
   repeated string blocks = 3;
 }
 
-// Compress it before store to cloud. Compress would help a lot for many md5 strings.
 message ObjectMD {
   // uuid for object put, to handle the possible concurrent puts for the same object.
   string uuid = 1;

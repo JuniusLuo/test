@@ -15,10 +15,12 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/golang/snappy"
 	"github.com/nu7hatch/gouuid"
 )
 
 var ioengine = flag.String("io", "fileio", "the cloud ioengine: fileio or cloudio")
+var cmp = flag.Bool("cmp", false, "whether enable compression")
 
 // S3Server handles the coming S3 requests
 type S3Server struct {
@@ -455,15 +457,24 @@ func (s *S3Server) putObject(w http.ResponseWriter, req s3Request, bkname string
 		return
 	}
 
+	// compress ObjectMD bytes
+	b := mdbyte
+	if *cmp {
+		// looks compression is not useful for ObjectMD.
+		// tried like /usr/local/bin/docker, 9MB, mdbyte is 2519, compress to 2524
+		b = snappy.Encode(nil, mdbyte)
+	}
+
 	// write out ObjectMD
-	status, errmsg = s.s3io.WriteObjectMD(bkname, objname, mdbyte)
+	status, errmsg = s.s3io.WriteObjectMD(bkname, objname, b)
 	if status != StatusOK {
 		glog.Errorln("failed to write ObjectMD", req.requuid, bkname, objname, status, errmsg)
 		http.Error(w, errmsg, status)
 		return
 	}
 
-	glog.V(0).Infoln("create object success", req.requuid, bkname, objname, md.Smd.Etag)
+	glog.V(0).Infoln("create object success", req.requuid, bkname, objname, md.Smd.Etag,
+		"compress", len(mdbyte), len(b))
 
 	w.Header().Set(ETag, md.Smd.Etag)
 	w.WriteHeader(status)
@@ -690,14 +701,26 @@ func (s *S3Server) getObjectMD(bkname string, objname string) (objmd *ObjectMD, 
 		return nil, status, errmsg
 	}
 
+	// uncompress ObjectMD bytes
+	mdbyte := b
+	var err error
+	if *cmp {
+		mdbyte, err = snappy.Decode(nil, b)
+		if err != nil {
+			glog.Errorln("failed to uncompress ObjectMD", bkname, objname, err)
+			return nil, InternalError, "failed to uncompress ObjectMD"
+		}
+	}
+
 	objmd = &ObjectMD{}
-	err := proto.Unmarshal(b, objmd)
+	err = proto.Unmarshal(mdbyte, objmd)
 	if err != nil {
 		glog.Errorln("failed to Unmarshal ObjectMD", bkname, objname, err)
 		return nil, InternalError, InternalErrorStr
 	}
 
-	glog.V(2).Infoln("successfully read object md", bkname, objname, objmd.Smd)
+	glog.V(2).Infoln("successfully read object md", bkname, objname, objmd.Smd,
+		"compress", len(mdbyte), len(b))
 	return objmd, StatusOK, StatusOKStr
 }
 
