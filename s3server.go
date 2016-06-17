@@ -1,14 +1,10 @@
 package test
 
 import (
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
 	"flag"
-	"hash"
 	"io"
 	"net/http"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -165,325 +161,26 @@ func (s *S3Server) putOp(w http.ResponseWriter, req s3Request, bkname string, ob
 			http.Error(w, NotImplementedStr, NotImplemented)
 		}
 	} else {
-		s.putObject(w, req, bkname, objname)
+		p := NewS3PutObject(req, s.s3io, bkname, objname)
+		p.PutObject(w, bkname, objname)
 	}
-}
-
-func (s *S3Server) readFullBuf(req s3Request, readBuf []byte) (n int, err error) {
-	readZero := false
-	var rlen int
-	for rlen < len(readBuf) {
-		n, err = req.r.Body.Read(readBuf[rlen:])
-		rlen += n
-
-		if err != nil {
-			return rlen, err
-		}
-
-		if n == 0 && err == nil {
-			if readZero {
-				glog.Errorln("read 0 bytes from http with nil error twice",
-					req.requuid, req.r.URL, req.r.Host)
-				return rlen, err
-			}
-			// allow read 0 byte with nil error once
-			readZero = true
-		}
-	}
-	return rlen, err
-}
-
-// if object data < ReadBufferSize
-func (s *S3Server) putSmallObjectData(req s3Request, md *ObjectMD) (status int, errmsg string) {
-	readBuf := make([]byte, req.r.ContentLength)
-
-	// read all data
-	n, err := s.readFullBuf(req, readBuf)
-	glog.V(4).Infoln(req.requuid, "read", n, err, "ContentLength",
-		req.r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-
-	if err != nil {
-		if err != io.EOF {
-			glog.Errorln("failed to read data from http", req.requuid, err, "ContentLength",
-				req.r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-			return InternalError, "failed to read data from http"
-		}
-
-		// EOF, check if all contents are readed
-		if int64(n) != req.r.ContentLength {
-			glog.Errorln(req.requuid, "read", n, "less than ContentLength",
-				req.r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-			return InvalidRequest, "data less than ContentLength"
-		}
-	}
-
-	// compute checksum
-	m := md5.New()
-	m.Write(readBuf)
-	md5byte := m.Sum(nil)
-	md5str := hex.EncodeToString(md5byte)
-	m.Reset()
-
-	// write data block
-	if !s.s3io.IsDataBlockExist(md5str) {
-		status, errmsg = s.s3io.WriteDataBlock(readBuf, md5str)
-		if status != StatusOK {
-			glog.Errorln("failed to create data block",
-				req.requuid, md5str, status, errmsg, md.Smd.Bucket, md.Smd.Name)
-			return status, errmsg
-		}
-		glog.V(2).Infoln("create data block", req.requuid, md5str, req.r.ContentLength)
-	} else {
-		md.Data.DdBlocks = 1
-		glog.V(2).Infoln("data block exists", req.requuid, md5str, req.r.ContentLength)
-	}
-
-	// add to data block
-	md.Data.BlockSize = ReadBufferSize
-	md.Data.Blocks = append(md.Data.Blocks, md5str)
-
-	// set etag
-	md.Smd.Etag = md5str
-	return StatusOK, StatusOKStr
-}
-
-type writeDataBlockResult struct {
-	md5str string // data block md5
-	exist  bool   // whether data block exists
-	status int
-	errmsg string
-}
-
-func (s *S3Server) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.Hash,
-	md *ObjectMD, c chan<- writeDataBlockResult, quit <-chan bool) {
-	// compute checksum
-	md5ck.Write(buf)
-	md5byte := md5ck.Sum(nil)
-	md5str := hex.EncodeToString(md5byte)
-	// reset md5 for the next block
-	md5ck.Reset()
-
-	// update etag
-	etag.Write(buf)
-
-	res := writeDataBlockResult{md5str, true, StatusOK, StatusOKStr}
-
-	// write data block
-	if !s.s3io.IsDataBlockExist(md5str) {
-		res.exist = false
-		res.status, res.errmsg = s.s3io.WriteDataBlock(buf, md5str)
-		glog.V(2).Infoln("create data block", md5str, res.status, len(buf))
-	} else {
-		glog.V(2).Infoln("data block exists", md5str, len(buf))
-	}
-
-	select {
-	case c <- res:
-		glog.V(5).Infoln("sent writeDataBlockResult", md5str, md.Smd)
-	case <-quit:
-		glog.V(5).Infoln("write data block quit", md.Smd)
-	case <-time.After(RWTimeOutSecs * time.Second):
-		glog.Errorln("write data block timeout", md5str, md.Smd,
-			"NumGoroutine", runtime.NumGoroutine())
-	}
-}
-
-// read object data and create data blocks.
-// this func will update data blocks and etag in ObjectMD
-func (s *S3Server) putObjectData(req s3Request, md *ObjectMD) (status int, errmsg string) {
-	r := req.r
-	if r.ContentLength <= ReadBufferSize {
-		return s.putSmallObjectData(req, md)
-	}
-
-	readBuf := make([]byte, ReadBufferSize)
-	writeBuf := make([]byte, ReadBufferSize)
-
-	md5ck := md5.New()
-	etag := md5.New()
-
-	var totalBlocks int64
-	// minimal dd blocks
-	var ddBlocks int64
-
-	// chan to wait till the previous write completes
-	c := make(chan writeDataBlockResult)
-	quit := make(chan bool)
-	waitWrite := false
-
-	var rlen int64
-	for rlen < r.ContentLength {
-		// read one block
-		n, err := s.readFullBuf(req, readBuf)
-		rlen += int64(n)
-		glog.V(4).Infoln(req.requuid, "read", n, err, "total readed len", rlen,
-			"specified read len", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-
-		if RandomFI() && !FIRandomSleep() {
-			glog.Errorln("FI at putObjectData", req.requuid, rlen, r.ContentLength,
-				md.Smd, "NumGoroutine", runtime.NumGoroutine())
-			if RandomFI() {
-				// test writer timeout to exit goroutine
-				return InternalError, "exit early to test chan timeout"
-			}
-			// test quit writer
-			err = io.EOF
-		}
-
-		if err != nil {
-			if err != io.EOF {
-				glog.Errorln("failed to read data from http", req.requuid, err, "readed len",
-					rlen, "ContentLength", r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-				if waitWrite {
-					glog.V(5).Infoln("notify writer to quit", md.Smd)
-					quit <- true
-				}
-				return InternalError, "failed to read data from http"
-			}
-
-			// EOF, check if all contents are readed
-			if rlen != r.ContentLength {
-				glog.Errorln(req.requuid, "read", rlen, "less than ContentLength",
-					r.ContentLength, md.Smd.Bucket, md.Smd.Name)
-				if waitWrite {
-					glog.V(5).Infoln("notify writer to quit", md.Smd)
-					quit <- true
-				}
-				return InvalidRequest, "data less than ContentLength"
-			}
-
-			// EOF, check if the last data block is 0
-			if n == 0 {
-				break // break the for loop
-			}
-
-			// write out the last data block
-		}
-
-		if waitWrite {
-			// wait data block write done
-			res := <-c
-
-			if res.status != StatusOK {
-				glog.Errorln("failed to create data block", req.requuid, res.md5str,
-					res.status, res.errmsg, md.Smd.Bucket, md.Smd.Name)
-				return res.status, res.errmsg
-			}
-
-			if res.exist {
-				ddBlocks++
-			}
-			totalBlocks++
-			// add to data block
-			md.Data.Blocks = append(md.Data.Blocks, res.md5str)
-		}
-
-		// write data block
-		// switch buffer, readBuf will be used to read the next data block
-		tmpbuf := readBuf
-		readBuf = writeBuf
-		writeBuf = tmpbuf
-		waitWrite = true
-		// Note: should we switch to a single routine, which loops to write data
-		// block. and here invoke the routine via chan? assume go internally has
-		// like a queue for all routines, and one thread per core to schedule them.
-		// Sounds no big difference? an old routine + chan vs a new routine.
-		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag, md, c, quit)
-	}
-
-	// wait the last write
-	if waitWrite {
-		// wait data block write done
-		res := <-c
-
-		if res.status != StatusOK {
-			glog.Errorln("failed to create data block", req.requuid, res.md5str,
-				res.status, res.errmsg, md.Smd.Bucket, md.Smd.Name)
-			return res.status, res.errmsg
-		}
-
-		if res.exist {
-			ddBlocks++
-		}
-		totalBlocks++
-		// add to data block
-		md.Data.Blocks = append(md.Data.Blocks, res.md5str)
-	}
-
-	glog.V(1).Infoln(req.requuid, md.Smd.Bucket, md.Smd.Name, r.ContentLength,
-		"totalBlocks", totalBlocks, "ddBlocks", ddBlocks)
-
-	etagbyte := etag.Sum(nil)
-	md.Smd.Etag = hex.EncodeToString(etagbyte)
-	md.Data.DdBlocks = ddBlocks
-	return StatusOK, StatusOKStr
-}
-
-func (s *S3Server) putObject(w http.ResponseWriter, req s3Request, bkname string, objname string) {
-	// Performance is one critical factor for this dedup layer. Not doing the
-	// additional operations here, such as bucket permission check, etc.
-	// When creating the metadata object, S3 will do all the checks. If S3
-	// rejects the request, no positive refs will be added for the data blocks.
-	// gc will clean up them in the background.
-
-	// create the metadata object
-	smd := &ObjectSMD{}
-	smd.Bucket = bkname
-	smd.Name = objname
-	smd.Mtime = time.Now().Unix()
-	smd.Size = req.r.ContentLength
-
-	data := &DataBlock{}
-	data.BlockSize = ReadBufferSize
-
-	md := &ObjectMD{}
-	md.Uuid = req.requuid
-	md.Smd = smd
-	md.Data = data
-
-	// read object data and create data blocks
-	status, errmsg := s.putObjectData(req, md)
-	if status != StatusOK {
-		glog.Errorln("put object failed", req.requuid, bkname, objname, status, errmsg)
-		http.Error(w, errmsg, status)
-		return
-	}
-
-	// Marshal ObjectMD to []byte
-	mdbyte, err := proto.Marshal(md)
-	if err != nil {
-		glog.Errorln("failed to marshal ObjectMD", req.requuid, bkname, objname, md, err)
-		http.Error(w, "failed to marshal ObjectMD", InternalError)
-		return
-	}
-
-	// compress ObjectMD bytes
-	b := mdbyte
-	if *cmp {
-		// looks compression is not useful for ObjectMD.
-		// tried like /usr/local/bin/docker, 9MB, mdbyte is 2519, compress to 2524
-		b = snappy.Encode(nil, mdbyte)
-	}
-
-	// write out ObjectMD
-	status, errmsg = s.s3io.WriteObjectMD(bkname, objname, b)
-	if status != StatusOK {
-		glog.Errorln("failed to write ObjectMD", req.requuid, bkname, objname, status, errmsg)
-		http.Error(w, errmsg, status)
-		return
-	}
-
-	glog.V(0).Infoln("create object success", req.requuid, bkname, objname, md.Smd.Etag,
-		"compress", len(mdbyte), len(b))
-
-	w.Header().Set(ETag, md.Smd.Etag)
-	w.WriteHeader(status)
 }
 
 type dataBlockReadResult struct {
-	blkIdx int
-	buf    []byte
-	n      int
+	partNum int
+	blkIdx  int
+	blkmd5  string
+	buf     []byte
+	n       int
+	status  int
+	errmsg  string
+}
+
+type dataPartReadResult struct {
+	// data part name
+	partName string
+	// the data blocks of the data part
+	data   *DataBlock
 	status int
 	errmsg string
 }
@@ -492,41 +189,75 @@ type objectDataIOReader struct {
 	w     http.ResponseWriter
 	s3io  CloudIO
 	objmd *ObjectMD
-	off   int64
+	// the read offset
+	off      int64
+	currPart *DataPart
 	// the current cached data block
 	currBlock dataBlockReadResult
-	// sanity check, whether needs to wait for the outgoing prefetch
+
+	// sanity check, whether needs to wait for the outgoing block prefetch
 	waitBlock bool
 	// channel to wait till the background prefetch complete
-	c chan dataBlockReadResult
+	blockChan chan dataBlockReadResult
+
+	// sanity check, whether needs to wait for the outgoing part prefetch
+	waitPart bool
+	partChan chan dataPartReadResult
+
 	// the reader is possible to involve 2 threads, th1 may be prefetching the block,
 	// th2 may be at any step of Read()
 	closed chan bool
-	// internal for FI usage only, to avoid close the chan multiple times
-	closeCalled bool
 }
 
-func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
-	res := dataBlockReadResult{blkIdx: blk, buf: b}
+func (d *objectDataIOReader) isLastBlock(partNum int, blkIdx int) bool {
+	data := d.objmd.Data
+	return partNum == len(data.DataParts)-1 && blkIdx == len(data.DataParts[partNum].Data.Blocks)-1
+}
 
+// check to make sure block is valid
+func (d *objectDataIOReader) isValidBlock(partNum int, blkIdx int) bool {
+	smd := d.objmd.Smd
 	// sanity check
-	if blk >= len(d.objmd.Data.Blocks) {
-		glog.Errorln("no more block to read", blk, d.objmd)
-		res.status = InternalError
-		res.errmsg = "no more block to read"
+	if partNum >= len(d.objmd.Data.DataParts) {
+		glog.Errorln("SanityError - read unexist part",
+			d.objmd.Uuid, partNum, len(d.objmd.Data.DataParts), smd.Bucket, smd.Name)
+		return false
+	}
+
+	dataPart := d.objmd.Data.DataParts[partNum]
+	// sanity check
+	if blkIdx >= len(dataPart.Data.Blocks) {
+		glog.Errorln("SanityError - read unexist block", d.objmd.Uuid,
+			blkIdx, len(dataPart.Data.Blocks), dataPart.Name, smd.Bucket, smd.Name)
+		return false
+	}
+
+	return true
+}
+
+func (d *objectDataIOReader) readBlock(partNum int, blkIdx int, b []byte) dataBlockReadResult {
+	// sanity check
+	if !d.isValidBlock(partNum, blkIdx) {
+		res := dataBlockReadResult{status: InternalError, errmsg: "read unexist block"}
 		return res
 	}
 
-	res.n, res.status, res.errmsg =
-		d.s3io.ReadDataBlockRange(d.objmd.Data.Blocks[blk], 0, res.buf)
+	smd := d.objmd.Smd
+	dataPart := d.objmd.Data.DataParts[partNum]
+	blkmd5 := dataPart.Data.Blocks[blkIdx]
 
-	glog.V(2).Infoln("read block done", blk, d.objmd.Data.Blocks[blk],
-		res.n, res.status, res.errmsg, d.objmd.Smd)
+	res := dataBlockReadResult{partNum: partNum, blkIdx: blkIdx, blkmd5: blkmd5, buf: b}
+
+	res.n, res.status, res.errmsg = d.s3io.ReadDataBlockRange(blkmd5, 0, res.buf)
+
+	glog.V(2).Infoln("read block done", d.objmd.Uuid, partNum, blkIdx,
+		blkmd5, res.n, res.status, res.errmsg, smd.Bucket, smd.Name)
 
 	if res.status == StatusOK && res.n != int(d.objmd.Data.BlockSize) &&
-		res.blkIdx != len(d.objmd.Data.Blocks)-1 {
+		!d.isLastBlock(partNum, blkIdx) {
 		// read less data, could only happen for the last block
-		glog.Errorln("not read full block", res.n, blk, d.objmd)
+		glog.Errorln("not read full block", d.objmd.Uuid, res.n,
+			d.objmd.Data.BlockSize, dataPart.Name, blkIdx, smd.Bucket, smd.Name)
 		res.status = InternalError
 		res.errmsg = "read less data for a full block"
 	}
@@ -534,36 +265,100 @@ func (d *objectDataIOReader) readBlock(blk int, b []byte) dataBlockReadResult {
 	return res
 }
 
-func (d *objectDataIOReader) prefetchBlock(blk int, b []byte) {
-	glog.V(5).Infoln("prefetchBlock start", blk, d.objmd.Smd)
+func (d *objectDataIOReader) prefetchBlock(partNum int, blk int, b []byte) {
+	glog.V(5).Infoln("prefetchBlock start", d.objmd.Uuid, partNum, blk, d.objmd.Smd)
 
 	if RandomFI() && !FIRandomSleep() {
 		// simulate the connection broken and closeChan() is called
-		glog.Errorln("FI at prefetchBlock, close d.closed chan", blk, d.objmd.Smd)
+		glog.Errorln("FI at prefetchBlock, close d.closed chan", d.objmd.Uuid, blk, d.objmd.Smd)
 		d.closeChan()
 	}
 
-	res := d.readBlock(blk, b)
+	res := d.readBlock(partNum, blk, b)
 	select {
-	case d.c <- res:
-		glog.V(5).Infoln("prefetchBlock sent res to chan done", blk, d.objmd.Smd)
+	case d.blockChan <- res:
+		glog.V(5).Infoln("prefetchBlock sent res to chan done", d.objmd.Uuid, blk, d.objmd.Smd)
 	case <-d.closed:
-		glog.Errorln("stop prefetchBlock, reader closed", blk, d.objmd.Smd)
+		glog.Errorln("stop prefetchBlock, reader closed", d.objmd.Uuid, blk, d.objmd.Smd)
 	case <-time.After(RWTimeOutSecs * time.Second):
-		glog.Errorln("stop prefetchBlock, timeout", blk, d.objmd.Smd)
+		glog.Errorln("stop prefetchBlock, timeout", d.objmd.Uuid, blk, d.objmd.Smd)
 	}
 }
 
-func (d *objectDataIOReader) closeChan() {
-	if FIEnabled() && d.closeCalled {
-		return
-	}
+func (d *objectDataIOReader) prefetchPart(partNum int) {
+	glog.V(5).Infoln("prefetchPart start", d.objmd.Uuid, partNum, d.objmd.Smd)
 
+}
+
+func (d *objectDataIOReader) closeChan() {
 	glog.V(5).Infoln("closeChan", d.off, d.objmd.Smd.Size)
 
 	// close the "closed" channel, so both prefetchBlock() and Read() can exit
 	close(d.closed)
-	d.closeCalled = true
+}
+
+func (d *objectDataIOReader) waitPrefetchBlock(partNum int, blkInPart int) error {
+	select {
+	case nextBlock := <-d.blockChan:
+		d.waitBlock = false
+
+		if nextBlock.status != StatusOK {
+			glog.Errorln("failed to prefetch block", d.objmd.Uuid,
+				nextBlock.partNum, nextBlock.blkIdx, nextBlock.status, nextBlock.errmsg)
+			return errors.New(nextBlock.errmsg)
+		}
+
+		// sanity check
+		if nextBlock.partNum != partNum || nextBlock.blkIdx != blkInPart {
+			glog.Errorln("the prefetch block is not the next read block", d.objmd.Uuid,
+				nextBlock.partNum, nextBlock.blkIdx, partNum, blkInPart, d.objmd.Smd)
+			return errors.New(InternalErrorStr)
+		}
+
+		glog.V(5).Infoln("get the prefetch block",
+			d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
+
+		// the next block is back, switch the current block to the next block
+		oldbuf := d.currBlock.buf
+		d.currBlock = nextBlock
+
+		// prefetch the next block if necessary
+		if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
+			if blkInPart == int(d.objmd.Data.MaxBlocks-1) {
+				// reach the last block, wait the prefetch part
+				err := d.waitPrefetchPart()
+				if err != nil {
+					return err
+				}
+
+				// if not reach the last part, prefetch the next part
+				if partNum < len(d.objmd.Data.DataParts)-2 {
+					d.waitPart = true
+					d.prefetchPart(partNum + 1)
+				}
+
+				// prefetch the first block in the next part
+				d.waitBlock = true
+				go d.prefetchBlock(partNum+1, 0, oldbuf)
+			} else {
+				// prefetch the next block in the same part
+				d.waitBlock = true
+				go d.prefetchBlock(partNum, blkInPart+1, oldbuf)
+			}
+		}
+		return nil
+	case <-d.closed:
+		glog.Errorln("stop Read, reader closed", d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
+		return errors.New("connection closed")
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("stop Read, timeout", d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
+		return errors.New("read timeout")
+	}
+}
+
+func (d *objectDataIOReader) waitPrefetchPart() error {
+
+	return nil
 }
 
 func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
@@ -573,73 +368,50 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	}
 
 	// compute the corresponding data block and offset inside data block
-	idx := int(d.off / int64(d.objmd.Data.BlockSize))
+	blockNum := int(d.off / int64(d.objmd.Data.BlockSize))
 	blockOff := int(d.off % int64(d.objmd.Data.BlockSize))
+	partNum := blockNum / int(d.objmd.Data.MaxBlocks)
+	blkIdx := blockNum % int(d.objmd.Data.MaxBlocks)
 
-	if idx < d.currBlock.blkIdx {
-		// sanity check, this should not happen
-		glog.Errorln("read the previous data again?",
-			d.off, idx, d.currBlock.blkIdx, d.objmd.Smd)
-		return 0, errors.New("Invalid read request, read previous data again")
-	}
-
-	if idx > d.currBlock.blkIdx {
+	// if current block is read out, wait for the next block
+	if partNum > d.currBlock.partNum || blkIdx > d.currBlock.blkIdx {
 		// sanity check, the prefetch task should be sent already
 		if !d.waitBlock {
-			glog.Errorln("no prefetch task", idx, d.off, d.objmd.Smd)
+			glog.Errorln("no prefetch task", blkIdx, d.off, d.objmd.Smd)
 			return 0, errors.New("InternalError, no prefetch task")
 		}
 
-		glog.V(5).Infoln("wait the prefetch block", idx, d.off, d.objmd.Smd)
+		glog.V(5).Infoln("wait the prefetch block", blkIdx, d.off, d.objmd.Smd)
 
 		if RandomFI() && !FIRandomSleep() {
 			// simulate the connection broken and Close() is called
 			// Q: looks the ongoing Read still goes through, d.closed looks not used here.
-			glog.Errorln("FI at Read, close d.closed chan", idx, d.off, d.objmd.Smd)
+			glog.Errorln("FI at Read, close d.closed chan", blkIdx, d.off, d.objmd.Smd)
 			d.closeChan()
 		}
 
-		// current block is read out, wait for the next block
-		select {
-		case nextBlock := <-d.c:
-			d.waitBlock = false
-
-			glog.V(5).Infoln("get the prefetch block", idx, d.off, d.objmd.Smd)
-
-			// the next block is back, switch the current block to the next block
-			oldbuf := d.currBlock.buf
-			d.currBlock = nextBlock
-
-			// prefetch the next block if necessary
-			if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
-				d.waitBlock = true
-				go d.prefetchBlock(d.currBlock.blkIdx+1, oldbuf)
-			}
-		case <-d.closed:
-			glog.Errorln("stop Read, reader closed", idx, d.off, d.objmd.Smd)
-			return 0, errors.New("connection closed")
-		case <-time.After(RWTimeOutSecs * time.Second):
-			glog.Errorln("stop Read, timeout", idx, d.off, d.objmd.Smd)
-			return 0, errors.New("read timeout")
+		err := d.waitPrefetchBlock(partNum, blkIdx)
+		if err != nil {
+			return 0, err
 		}
 	}
 
 	// check the current block read status
 	if d.currBlock.status != StatusOK {
-		glog.Errorln("read data block failed", idx, d.objmd.Data.Blocks[idx],
+		glog.Errorln("read data block failed", d.objmd.Uuid, partNum, blkIdx,
 			d.off, d.currBlock.status, d.currBlock.errmsg, d.objmd.Smd)
 		return 0, errors.New(d.currBlock.errmsg)
 	}
 
 	// fill data from the current block
 	glog.V(2).Infoln("fill data from currBlock",
-		idx, blockOff, d.off, d.currBlock.n, d.objmd.Smd)
+		blkIdx, blockOff, d.off, d.currBlock.n, d.objmd.Smd)
 
 	endOff := blockOff + len(p)
 	if endOff <= d.currBlock.n {
 		// currBlock has more data than p
 		glog.V(5).Infoln("currBlock has enough data",
-			idx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
+			blkIdx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
 
 		copy(p, d.currBlock.buf[blockOff:endOff])
 		n = len(p)
@@ -647,7 +419,7 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 		// p could have more data than the rest in currBlock
 		// TODO copy the rest data from the next block
 		glog.V(5).Infoln("read the end of currBlock",
-			idx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
+			blkIdx, blockOff, endOff, d.off, d.currBlock.n, d.objmd.Smd)
 
 		copy(p, d.currBlock.buf[blockOff:d.currBlock.n])
 		n = d.currBlock.n - blockOff
@@ -754,11 +526,12 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, req s3Request, bkname stri
 
 	// synchronously read the first block
 	b := make([]byte, objmd.Data.BlockSize)
-	rd.currBlock = rd.readBlock(0, b)
+	rd.currBlock = rd.readBlock(0, 0, b)
 
 	// check the first block read status
 	if rd.currBlock.status != StatusOK {
-		glog.Errorln("read first data block failed", req.requuid, objmd.Data.Blocks[0],
+		glog.Errorln("read first data block failed",
+			req.requuid, objmd.Data.DataParts[0].Data.Blocks[0],
 			rd.currBlock.status, rd.currBlock.errmsg, bkname, objname)
 		http.Error(w, rd.currBlock.errmsg, rd.currBlock.status)
 		return
@@ -766,10 +539,17 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, req s3Request, bkname stri
 
 	// if there are more data to read, start the prefetch task
 	if objmd.Smd.Size > int64(objmd.Data.BlockSize) {
-		rd.c = make(chan dataBlockReadResult)
+		rd.blockChan = make(chan dataBlockReadResult)
 		nextbuf := make([]byte, objmd.Data.BlockSize)
 		rd.waitBlock = true
-		go rd.prefetchBlock(1, nextbuf)
+		go rd.prefetchBlock(0, 1, nextbuf)
+	}
+
+	// if there are more than 2 parts, start the prefetch task
+	if len(objmd.Data.DataParts) > 2 {
+		rd.partChan = make(chan dataPartReadResult)
+		rd.waitPart = true
+		go rd.prefetchPart(1)
 	}
 
 	n, err := io.Copy(w, rd)

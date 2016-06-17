@@ -3,9 +3,13 @@ package test
 // Misc system default configs
 const (
 	// default read 128KB
-	ReadBufferSize = 131072
+	DataBlockSize = 131072
+	// ObjectMD data block split threshold, 4k blocks would be 4k*32bytes=128KB
+	MaxDataBlocks    = 4096
+	MaxDataBlockSize = DataBlockSize * MaxDataBlocks
 	// 30s timeout for every single read/write operation
-	RWTimeOutSecs = 30
+	RWTimeOutSecs    = 30
+	DefaultSeparator = "."
 )
 
 //const (

@@ -16,6 +16,7 @@ type FileIO struct {
 	rootDir       string
 	rootBucketDir string
 	rootDataDir   string
+	rootPartDir   string
 }
 
 // Misc const definition for FileIO
@@ -30,6 +31,7 @@ func NewFileIO() *FileIO {
 	f.rootDir = "/tmp/clouddd/"
 	f.rootBucketDir = f.rootDir + "bucket/"
 	f.rootDataDir = f.rootDir + "data/"
+	f.rootPartDir = f.rootDir + "part/"
 
 	err := os.MkdirAll(f.rootBucketDir, DefaultDirMode)
 	if err != nil && !os.IsExist(err) {
@@ -40,6 +42,12 @@ func NewFileIO() *FileIO {
 	err = os.MkdirAll(f.rootDataDir, DefaultDirMode)
 	if err != nil && !os.IsExist(err) {
 		glog.Errorln("failed to create", f.rootDataDir, err)
+		return nil
+	}
+
+	err = os.MkdirAll(f.rootPartDir, DefaultDirMode)
+	if err != nil && !os.IsExist(err) {
+		glog.Errorln("failed to create", f.rootPartDir, err)
 		return nil
 	}
 

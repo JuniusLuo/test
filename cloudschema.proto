@@ -24,10 +24,14 @@ message Acl {
 
 }
 
-message ObjectUMD {
+message UMD {
   string key = 1;
   string strval = 2;
   string byteval = 3;
+}
+
+message ObjectUMD {
+  repeated UMD umd = 1;
 }
 
 // md5 is 32 bytes. if data block is 128KB, 128MB object has 1k blocks, 32KB.
@@ -43,15 +47,31 @@ message ObjectUMD {
 //    will be stored directly in the meta object with other metadata.
 //
 // #3 is best.
-message DataBlock {
+//
+// Just a reference: DD block size is probably 64KB.
+message ObjectData {
   // data block size, such as 128KB
   int32 blockSize = 1;
   // the draft estimation of the dedup blocks. this may not be
   // accurate as concurrent puts could come around the same time.
   // there could have more dedup blocks, but will not less.
   int64 ddBlocks = 2;
-  // data blocks
-  repeated string blocks = 3;
+  // max blocks per part
+  int32 maxBlocks = 3;
+  // to support the large object, blocks could be split to parts.
+  // the first and last part could have embeded blocks
+  repeated DataPart dataParts = 4;
+}
+
+message DataPart {
+  // part name
+  string name = 1;
+  // the possible embeded blocks
+  DataBlock data = 3;
+}
+
+message DataBlock {
+  repeated string blocks = 1;
 }
 
 message ObjectMD {
@@ -62,9 +82,8 @@ message ObjectMD {
   Acl acl = 3;
   ObjectUMD umd = 4;
 
-  DataBlock data = 5;
-  // every data part will store one DataBlock
-  repeated string dataParts = 6;
+  // the first DataBlock
+  ObjectData data = 5;
 }
 
 // the positive and negative refs for one block.
