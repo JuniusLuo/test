@@ -18,4 +18,7 @@ type CloudIO interface {
 	// fetch the content of every object.
 	WriteObjectMD(bkname string, objname string, mdbuf []byte) (status int, errmsg string)
 	ReadObjectMD(bkname string, objname string) (b []byte, status int, errmsg string)
+
+	WriteDataPart(bkname string, partName string, b []byte) (status int, errmsg string)
+	ReadDataPart(bkname string, partName string) (b []byte, status int, errmsg string)
 }

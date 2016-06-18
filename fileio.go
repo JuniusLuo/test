@@ -260,3 +260,25 @@ func (f *FileIO) ReadDataBlockRange(md5str string, off int64, b []byte) (n int, 
 
 	return n, StatusOK, StatusOKStr
 }
+
+// WriteDataPart creates the data part object
+func (f *FileIO) WriteDataPart(bkname string, partName string, b []byte) (status int, errmsg string) {
+	fname := f.rootPartDir + bkname + "/" + partName
+	err := ioutil.WriteFile(fname, b, DefaultFileMode)
+	if err != nil {
+		glog.Errorln("failed to create data part file", fname, err)
+		return InternalError, "failed to create data part file"
+	}
+	return StatusOK, StatusOKStr
+}
+
+// ReadDataPart reads the data part object
+func (f *FileIO) ReadDataPart(bkname string, partName string) (b []byte, status int, errmsg string) {
+	fname := f.rootPartDir + bkname + "/" + partName
+	b, err := ioutil.ReadFile(fname)
+	if err != nil {
+		glog.Errorln("failed to read data part file", fname, err)
+		return nil, InternalError, "failed to read data part file"
+	}
+	return b, StatusOK, StatusOKStr
+}

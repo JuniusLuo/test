@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"runtime"
-	"strconv"
 	"time"
 
 	"github.com/golang/glog"
@@ -33,7 +32,7 @@ type S3PutObject struct {
 	// chan to wait for the data block write done
 	blockChan chan writeDataBlockResult
 	// chan to wait for the data part write done
-	partChan chan writeBlockPartResult
+	partChan chan writeDataPartResult
 	// chan to notify the block/part routines to quit
 	quitChan chan bool
 }
@@ -48,13 +47,9 @@ func NewS3PutObject(req s3Request, s3io CloudIO, bkname string, objname string) 
 	return s
 }
 
-func (s *S3PutObject) genPartName(uuid string, partNum int) string {
-	return uuid + DefaultSeparator + strconv.Itoa(partNum)
-}
-
 func (s *S3PutObject) addPart(block *DataBlock, partNum int) {
 	part := &DataPart{}
-	part.Name = s.genPartName(s.md.Uuid, partNum)
+	part.Name = GenPartName(s.md.Uuid, partNum)
 	part.Data = block
 
 	s.md.Data.DataParts = append(s.md.Data.DataParts, part)
@@ -183,19 +178,45 @@ func (s *S3PutObject) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.H
 	}
 }
 
-type writeBlockPartResult struct {
-	partNum  int
+type writeDataPartResult struct {
 	partName string
+	partNum  int
 	status   int
 	errmsg   string
 }
 
 // create the part object for the block
 func (s *S3PutObject) writeDataPart(block *DataBlock, partName string, partNum int) {
+	glog.V(2).Infoln("start creating data part", s.req.requuid, partName, s.bkname, s.objname)
+
+	res := writeDataPartResult{partName, partNum, StatusOK, StatusOKStr}
+
+	b, err := proto.Marshal(block)
+	if err == nil {
+		res.status, res.errmsg = s.s3io.WriteDataPart(s.bkname, partName, b)
+		glog.V(2).Infoln("create data part done", s.req.requuid,
+			partName, s.bkname, s.objname, res.status, res.errmsg)
+	} else {
+		glog.Errorln("failed to Marshal DataBlock",
+			s.req.requuid, partName, s.bkname, s.objname, err)
+		res.status = InternalError
+		res.errmsg = "failed to Marshal DataBlock"
+	}
+
+	select {
+	case s.partChan <- res:
+		glog.V(5).Infoln("sent writeDataPartResult",
+			s.req.requuid, partName, s.bkname, s.objname)
+	case <-s.quitChan:
+		glog.V(5).Infoln("write data part quit", s.req.requuid, partName, s.bkname, s.objname)
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("send writeDataPartResult timeout",
+			s.req.requuid, partName, s.bkname, s.objname)
+	}
 
 }
 
-func (s *S3PutObject) waitDataPart(partNum int) (status int, errmsg string) {
+func (s *S3PutObject) waitAndAddDataPart(partNum int) (status int, errmsg string) {
 	// third or later block part, wait for the previous part result
 	glog.V(5).Infoln("wait for part write result", s.req.requuid, s.bkname, s.objname)
 
@@ -206,7 +227,7 @@ func (s *S3PutObject) waitDataPart(partNum int) (status int, errmsg string) {
 	}
 
 	// sanity check
-	if partres.partNum != partNum-1 {
+	if partres.partNum != partNum {
 		glog.Errorln("partNum not match", s.req.requuid, s.bkname, s.objname, partres.partNum, partNum)
 		return InternalError, InternalErrorStr
 	}
@@ -249,21 +270,21 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 
 	// wait the last part
 	if !waitPart {
-		// no split happened, the block is the head block
+		// no split happened, total parts <= 2
 		// sanity check, partNum should be 0
-		if partNum != 0 {
-			glog.Errorln("no part split happened, but partNum is not 0",
+		if partNum != 0 && partNum != 1 {
+			glog.Errorln("no part split happened, but partNum is not 0 or 1",
 				s.req.requuid, partNum, s.bkname, s.objname)
 			return InternalError, InternalErrorStr
 		}
 
-		glog.V(5).Infoln("all data in HeadBlock",
-			s.req.requuid, len(block.Blocks), s.bkname, s.objname)
+		glog.V(5).Infoln("add the last part",
+			s.req.requuid, partNum, len(block.Blocks), s.bkname, s.objname)
 
 		s.addPart(block, partNum)
 	} else {
 		// wait the data part
-		status, errmsg = s.waitDataPart(partNum)
+		status, errmsg = s.waitAndAddDataPart(partNum - 1)
 		if status != StatusOK {
 			return status, errmsg
 		}
@@ -271,10 +292,8 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 		glog.V(2).Infoln("check the last part",
 			s.req.requuid, partNum, len(block.Blocks), s.bkname, s.objname)
 
-		// check if the last block has any data
-		if len(block.Blocks) != 0 {
-			s.addPart(block, partNum)
-		}
+		// add the last part
+		s.addPart(block, partNum)
 	}
 
 	return StatusOK, StatusOKStr
@@ -292,7 +311,7 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 	block := &DataBlock{}
 	partNum := 0
 	waitPart := false
-	s.partChan = make(chan writeBlockPartResult)
+	s.partChan = make(chan writeDataPartResult)
 
 	readBuf := make([]byte, DataBlockSize)
 	writeBuf := make([]byte, DataBlockSize)
@@ -352,12 +371,13 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 		if waitWrite {
 			// wait data block write done
 			res := <-s.blockChan
-
 			if res.status != StatusOK {
 				glog.Errorln("failed to create data block", s.req.requuid, res.md5str,
 					res.status, res.errmsg, s.bkname, s.objname)
 				return res.status, res.errmsg
 			}
+
+			glog.V(5).Infoln("data block write success", s.req.requuid, res.md5str, s.bkname, s.objname)
 
 			if res.exist {
 				s.ddBlocks++
@@ -373,11 +393,11 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 		tmpbuf := readBuf
 		readBuf = writeBuf
 		writeBuf = tmpbuf
-		waitWrite = true
 		// Note: should we switch to a single routine, which loops to write data
 		// block. and here invoke the routine via chan? assume go internally has
 		// like a queue for all routines, and one thread per core to schedule them.
 		// Sounds no big difference? an old routine + chan vs a new routine.
+		waitWrite = true
 		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag)
 
 		// check whether need to split data to parts
@@ -392,7 +412,7 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 			} else if partNum >= 1 {
 				if partNum > 1 {
 					// wait the data part
-					status, errmsg = s.waitDataPart(partNum)
+					status, errmsg = s.waitAndAddDataPart(partNum - 1)
 					if status != StatusOK {
 						return status, errmsg
 					}
@@ -401,7 +421,7 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 				glog.V(2).Infoln("write data part", s.md.Uuid, partNum, s.bkname, s.objname)
 
 				// write data part
-				partName := s.genPartName(s.md.Uuid, partNum)
+				partName := GenPartName(s.md.Uuid, partNum)
 				waitPart = true
 				go s.writeDataPart(block, partName, partNum)
 			}

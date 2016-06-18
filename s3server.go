@@ -179,19 +179,22 @@ type dataBlockReadResult struct {
 type dataPartReadResult struct {
 	// data part name
 	partName string
-	// the data blocks of the data part
-	data   *DataBlock
-	status int
-	errmsg string
+	partNum  int
+	part     *DataPart
+	status   int
+	errmsg   string
 }
 
 type objectDataIOReader struct {
 	w     http.ResponseWriter
+	req   s3Request
 	s3io  CloudIO
 	objmd *ObjectMD
+
 	// the read offset
-	off      int64
-	currPart *DataPart
+	off int64
+	// data part of the currBlock
+	currPart dataPartReadResult
 	// the current cached data block
 	currBlock dataBlockReadResult
 
@@ -220,14 +223,14 @@ func (d *objectDataIOReader) isValidBlock(partNum int, blkIdx int) bool {
 	// sanity check
 	if partNum >= len(d.objmd.Data.DataParts) {
 		glog.Errorln("SanityError - read unexist part",
-			d.objmd.Uuid, partNum, len(d.objmd.Data.DataParts), smd.Bucket, smd.Name)
+			d.req.requuid, partNum, len(d.objmd.Data.DataParts), smd.Bucket, smd.Name)
 		return false
 	}
 
 	dataPart := d.objmd.Data.DataParts[partNum]
 	// sanity check
 	if blkIdx >= len(dataPart.Data.Blocks) {
-		glog.Errorln("SanityError - read unexist block", d.objmd.Uuid,
+		glog.Errorln("SanityError - read unexist block", d.req.requuid,
 			blkIdx, len(dataPart.Data.Blocks), dataPart.Name, smd.Bucket, smd.Name)
 		return false
 	}
@@ -236,6 +239,8 @@ func (d *objectDataIOReader) isValidBlock(partNum int, blkIdx int) bool {
 }
 
 func (d *objectDataIOReader) readBlock(partNum int, blkIdx int, b []byte) dataBlockReadResult {
+	res := dataBlockReadResult{partNum: partNum, blkIdx: blkIdx, buf: b}
+
 	// sanity check
 	if !d.isValidBlock(partNum, blkIdx) {
 		res := dataBlockReadResult{status: InternalError, errmsg: "read unexist block"}
@@ -244,19 +249,17 @@ func (d *objectDataIOReader) readBlock(partNum int, blkIdx int, b []byte) dataBl
 
 	smd := d.objmd.Smd
 	dataPart := d.objmd.Data.DataParts[partNum]
-	blkmd5 := dataPart.Data.Blocks[blkIdx]
+	res.blkmd5 = dataPart.Data.Blocks[blkIdx]
 
-	res := dataBlockReadResult{partNum: partNum, blkIdx: blkIdx, blkmd5: blkmd5, buf: b}
+	res.n, res.status, res.errmsg = d.s3io.ReadDataBlockRange(res.blkmd5, 0, res.buf)
 
-	res.n, res.status, res.errmsg = d.s3io.ReadDataBlockRange(blkmd5, 0, res.buf)
-
-	glog.V(2).Infoln("read block done", d.objmd.Uuid, partNum, blkIdx,
-		blkmd5, res.n, res.status, res.errmsg, smd.Bucket, smd.Name)
+	glog.V(2).Infoln("read block done", d.req.requuid, partNum, blkIdx,
+		res.blkmd5, res.n, res.status, res.errmsg, smd.Bucket, smd.Name)
 
 	if res.status == StatusOK && res.n != int(d.objmd.Data.BlockSize) &&
 		!d.isLastBlock(partNum, blkIdx) {
 		// read less data, could only happen for the last block
-		glog.Errorln("not read full block", d.objmd.Uuid, res.n,
+		glog.Errorln("not read full block", d.req.requuid, res.n,
 			d.objmd.Data.BlockSize, dataPart.Name, blkIdx, smd.Bucket, smd.Name)
 		res.status = InternalError
 		res.errmsg = "read less data for a full block"
@@ -266,28 +269,61 @@ func (d *objectDataIOReader) readBlock(partNum int, blkIdx int, b []byte) dataBl
 }
 
 func (d *objectDataIOReader) prefetchBlock(partNum int, blk int, b []byte) {
-	glog.V(5).Infoln("prefetchBlock start", d.objmd.Uuid, partNum, blk, d.objmd.Smd)
+	glog.V(5).Infoln("prefetchBlock start", d.req.requuid, partNum, blk, d.objmd.Smd)
 
 	if RandomFI() && !FIRandomSleep() {
 		// simulate the connection broken and closeChan() is called
-		glog.Errorln("FI at prefetchBlock, close d.closed chan", d.objmd.Uuid, blk, d.objmd.Smd)
+		glog.Errorln("FI at prefetchBlock, close d.closed chan", d.req.requuid, blk, d.objmd.Smd)
 		d.closeChan()
 	}
 
 	res := d.readBlock(partNum, blk, b)
+
 	select {
 	case d.blockChan <- res:
-		glog.V(5).Infoln("prefetchBlock sent res to chan done", d.objmd.Uuid, blk, d.objmd.Smd)
+		glog.V(5).Infoln("prefetchBlock sent to chan done", d.req.requuid, blk, d.objmd.Smd)
 	case <-d.closed:
-		glog.Errorln("stop prefetchBlock, reader closed", d.objmd.Uuid, blk, d.objmd.Smd)
+		glog.Errorln("stop prefetchBlock, reader closed", d.req.requuid, blk, d.objmd.Smd)
 	case <-time.After(RWTimeOutSecs * time.Second):
-		glog.Errorln("stop prefetchBlock, timeout", d.objmd.Uuid, blk, d.objmd.Smd)
+		glog.Errorln("stop prefetchBlock, timeout", d.req.requuid, blk, d.objmd.Smd)
 	}
 }
 
 func (d *objectDataIOReader) prefetchPart(partNum int) {
-	glog.V(5).Infoln("prefetchPart start", d.objmd.Uuid, partNum, d.objmd.Smd)
+	glog.V(5).Infoln("prefetchPart start", d.req.requuid, partNum, d.objmd.Smd)
 
+	partName := GenPartName(d.objmd.Uuid, partNum)
+
+	res := dataPartReadResult{partName: partName, partNum: partNum,
+		status: StatusOK, errmsg: StatusOKStr}
+
+	b, status, errmsg := d.s3io.ReadDataPart(d.objmd.Smd.Bucket, partName)
+	if status == StatusOK {
+		glog.V(5).Infoln("prefetchPart success", d.req.requuid, partNum, d.objmd.Smd)
+
+		part := &DataPart{}
+		err := proto.Unmarshal(b, part)
+		if err != nil {
+			glog.Errorln("failed to Unmarshal DataPart", d.req.requuid, partNum, err, d.objmd.Smd)
+			res.status = InternalError
+			res.errmsg = "failed to Unmarshal DataPart"
+		} else {
+			res.part = part
+		}
+	} else {
+		glog.Errorln("failed to ReadDataPart", d.req.requuid, partNum, status, errmsg, d.objmd.Smd)
+		res.status = status
+		res.errmsg = errmsg
+	}
+
+	select {
+	case d.partChan <- res:
+		glog.V(5).Infoln("prefetchPart sent to chan done", d.req.requuid, partNum, d.objmd.Smd)
+	case <-d.closed:
+		glog.Errorln("stop prefetchPart, reader closed", d.req.requuid, partNum, d.objmd.Smd)
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("stop prefetchPart, timeout", d.req.requuid, partNum, d.objmd.Smd)
+	}
 }
 
 func (d *objectDataIOReader) closeChan() {
@@ -303,43 +339,39 @@ func (d *objectDataIOReader) waitPrefetchBlock(partNum int, blkInPart int) error
 		d.waitBlock = false
 
 		if nextBlock.status != StatusOK {
-			glog.Errorln("failed to prefetch block", d.objmd.Uuid,
+			glog.Errorln("failed to prefetch block", d.req.requuid,
 				nextBlock.partNum, nextBlock.blkIdx, nextBlock.status, nextBlock.errmsg)
 			return errors.New(nextBlock.errmsg)
 		}
 
 		// sanity check
 		if nextBlock.partNum != partNum || nextBlock.blkIdx != blkInPart {
-			glog.Errorln("the prefetch block is not the next read block", d.objmd.Uuid,
+			glog.Errorln("the prefetch block is not the next read block", d.req.requuid,
 				nextBlock.partNum, nextBlock.blkIdx, partNum, blkInPart, d.objmd.Smd)
 			return errors.New(InternalErrorStr)
 		}
 
 		glog.V(5).Infoln("get the prefetch block",
-			d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
+			d.req.requuid, partNum, blkInPart, d.off, d.objmd.Smd)
 
 		// the next block is back, switch the current block to the next block
 		oldbuf := d.currBlock.buf
 		d.currBlock = nextBlock
 
 		// prefetch the next block if necessary
-		if d.currBlock.status == StatusOK && d.off+int64(d.currBlock.n) < d.objmd.Smd.Size {
+		if d.currBlock.status == StatusOK && !d.isLastBlock(partNum, blkInPart) {
 			if blkInPart == int(d.objmd.Data.MaxBlocks-1) {
-				// reach the last block, wait the prefetch part
+				// read the last block in the currPart, wait prefetch part
 				err := d.waitPrefetchPart()
 				if err != nil {
 					return err
 				}
 
-				// if not reach the last part, prefetch the next part
-				if partNum < len(d.objmd.Data.DataParts)-2 {
-					d.waitPart = true
-					d.prefetchPart(partNum + 1)
-				}
-
 				// prefetch the first block in the next part
-				d.waitBlock = true
-				go d.prefetchBlock(partNum+1, 0, oldbuf)
+				if d.currPart.part.Data != nil && len(d.currPart.part.Data.Blocks) != 0 {
+					d.waitBlock = true
+					go d.prefetchBlock(d.currPart.partNum, 0, oldbuf)
+				}
 			} else {
 				// prefetch the next block in the same part
 				d.waitBlock = true
@@ -347,23 +379,69 @@ func (d *objectDataIOReader) waitPrefetchBlock(partNum int, blkInPart int) error
 			}
 		}
 		return nil
-	case <-d.closed:
-		glog.Errorln("stop Read, reader closed", d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
-		return errors.New("connection closed")
 	case <-time.After(RWTimeOutSecs * time.Second):
-		glog.Errorln("stop Read, timeout", d.objmd.Uuid, partNum, blkInPart, d.off, d.objmd.Smd)
-		return errors.New("read timeout")
+		glog.Errorln("waitPrefetchBlock timeout", d.req.requuid, partNum, blkInPart, d.off, d.objmd.Smd)
+		return errors.New("waitPrefetchBlock timeout")
 	}
 }
 
 func (d *objectDataIOReader) waitPrefetchPart() error {
+	totalParts := len(d.objmd.Data.DataParts)
 
-	return nil
+	if !d.waitPart {
+		// no more part to prefetch, the current part must be the last-1 part.
+		if d.currPart.partNum != totalParts-2 {
+			glog.Errorln("SanityError - the currPart is not the last-2 part",
+				d.req.requuid, d.currPart.partNum, totalParts, d.objmd.Smd)
+			return errors.New(InternalErrorStr)
+		}
+
+		// set the currPart to the last part
+		glog.V(2).Infoln("set the last part as currPart",
+			d.req.requuid, d.currPart.partNum, totalParts-1, d.objmd.Smd)
+
+		part := d.objmd.Data.DataParts[totalParts-1]
+		res := dataPartReadResult{partName: part.Name, partNum: totalParts - 1, part: part,
+			status: StatusOK, errmsg: StatusOKStr}
+		d.currPart = res
+		return nil
+	}
+
+	glog.V(5).Infoln("wait the prefetch part", d.req.requuid, d.currPart.partNum+1, d.objmd.Smd)
+
+	select {
+	case nextPart := <-d.partChan:
+		d.waitPart = false
+
+		if nextPart.status != StatusOK {
+			glog.Errorln("failed to prefetch part", d.req.requuid,
+				nextPart.partNum, nextPart.status, nextPart.errmsg)
+			return errors.New(nextPart.errmsg)
+		}
+
+		glog.V(5).Infoln("get the prefetch part", d.req.requuid, nextPart.partNum, d.objmd.Smd)
+
+		// the next block is back, switch the current block to the next block
+		d.currPart = nextPart
+
+		// if not last-1 part, prefetch the next part
+		if d.currPart.partNum < totalParts-2 {
+			d.waitPart = true
+			d.prefetchPart(d.currPart.partNum + 1)
+		}
+		return nil
+	case <-d.closed:
+		glog.Errorln("waitPrefetchPart reader closed", d.req.requuid, d.currPart.partNum+1, d.objmd.Smd)
+		return errors.New("connection closed")
+	case <-time.After(RWTimeOutSecs * time.Second):
+		glog.Errorln("waitPrefetchPart timeout", d.req.requuid, d.currPart.partNum+1, d.objmd.Smd)
+		return errors.New("read timeout")
+	}
 }
 
 func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	if d.off >= d.objmd.Smd.Size {
-		glog.V(1).Infoln("finish read object data", d.objmd.Smd)
+		glog.V(1).Infoln("finish read object data", d.req.requuid, d.objmd.Smd)
 		return 0, io.EOF
 	}
 
@@ -377,16 +455,18 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 	if partNum > d.currBlock.partNum || blkIdx > d.currBlock.blkIdx {
 		// sanity check, the prefetch task should be sent already
 		if !d.waitBlock {
-			glog.Errorln("no prefetch task", blkIdx, d.off, d.objmd.Smd)
+			glog.Errorln("no prefetch task", d.req.requuid, partNum, blkIdx, d.off, d.objmd.Smd)
 			return 0, errors.New("InternalError, no prefetch task")
 		}
 
-		glog.V(5).Infoln("wait the prefetch block", blkIdx, d.off, d.objmd.Smd)
+		glog.V(5).Infoln("wait the prefetch block",
+			d.req.requuid, partNum, blkIdx, d.off, d.objmd.Smd)
 
 		if RandomFI() && !FIRandomSleep() {
 			// simulate the connection broken and Close() is called
 			// Q: looks the ongoing Read still goes through, d.closed looks not used here.
-			glog.Errorln("FI at Read, close d.closed chan", blkIdx, d.off, d.objmd.Smd)
+			glog.Errorln("FI at Read, close d.closed chan",
+				d.req.requuid, blkIdx, d.off, d.objmd.Smd)
 			d.closeChan()
 		}
 
@@ -398,7 +478,7 @@ func (d *objectDataIOReader) Read(p []byte) (n int, err error) {
 
 	// check the current block read status
 	if d.currBlock.status != StatusOK {
-		glog.Errorln("read data block failed", d.objmd.Uuid, partNum, blkIdx,
+		glog.Errorln("read data block failed", d.req.requuid, partNum, blkIdx,
 			d.off, d.currBlock.status, d.currBlock.errmsg, d.objmd.Smd)
 		return 0, errors.New(d.currBlock.errmsg)
 	}
@@ -520,6 +600,7 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, req s3Request, bkname stri
 	// read the corresponding data blocks
 	rd := new(objectDataIOReader)
 	rd.w = w
+	rd.req = req
 	rd.s3io = s.s3io
 	rd.objmd = objmd
 	rd.closed = make(chan bool)
@@ -557,7 +638,7 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, req s3Request, bkname stri
 		// n == 0 is also an error,
 		glog.Errorln("get object failed", req.requuid, bkname, objname, n, err)
 		if n == 0 {
-			// n == 0 is also an error. if object size is 0, will not reach here.
+			// n == 0 is also an error. if object size is not 0, will not reach here.
 			// read and write 0 data, w.Write may not be called in io.Copy
 			w.WriteHeader(InternalError)
 		}

@@ -48,7 +48,7 @@ message ObjectUMD {
 //
 // #3 is best.
 //
-// Just a reference: DD block size is probably 64KB.
+// Just a reference: DD block size is variable and ends up being 4K-12K, another says 64KB?
 message ObjectData {
   // data block size, such as 128KB
   int32 blockSize = 1;
@@ -59,7 +59,8 @@ message ObjectData {
   // max blocks per part
   int32 maxBlocks = 3;
   // to support the large object, blocks could be split to parts.
-  // the first and last part could have embeded blocks
+  // the first and last part could have embeded blocks, to simplify the read flow,
+  // the last part may not have block.
   repeated DataPart dataParts = 4;
 }
 
@@ -67,7 +68,7 @@ message DataPart {
   // part name
   string name = 1;
   // the possible embeded blocks
-  DataBlock data = 3;
+  DataBlock data = 2;
 }
 
 message DataBlock {
