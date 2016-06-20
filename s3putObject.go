@@ -186,19 +186,19 @@ type writeDataPartResult struct {
 }
 
 // create the part object for the block
-func (s *S3PutObject) writeDataPart(block *DataBlock, partName string, partNum int) {
-	glog.V(2).Infoln("start creating data part", s.req.requuid, partName, s.bkname, s.objname)
+func (s *S3PutObject) writeDataPart(part *DataPart, partNum int) {
+	glog.V(2).Infoln("start creating data part", s.req.requuid, part.Name, s.bkname, s.objname)
 
-	res := writeDataPartResult{partName, partNum, StatusOK, StatusOKStr}
+	res := writeDataPartResult{part.Name, partNum, StatusOK, StatusOKStr}
 
-	b, err := proto.Marshal(block)
+	b, err := proto.Marshal(part)
 	if err == nil {
-		res.status, res.errmsg = s.s3io.WriteDataPart(s.bkname, partName, b)
+		res.status, res.errmsg = s.s3io.WriteDataPart(s.bkname, part.Name, b)
 		glog.V(2).Infoln("create data part done", s.req.requuid,
-			partName, s.bkname, s.objname, res.status, res.errmsg)
+			part.Name, s.bkname, s.objname, res.status, res.errmsg)
 	} else {
 		glog.Errorln("failed to Marshal DataBlock",
-			s.req.requuid, partName, s.bkname, s.objname, err)
+			s.req.requuid, part.Name, s.bkname, s.objname, err)
 		res.status = InternalError
 		res.errmsg = "failed to Marshal DataBlock"
 	}
@@ -206,14 +206,13 @@ func (s *S3PutObject) writeDataPart(block *DataBlock, partName string, partNum i
 	select {
 	case s.partChan <- res:
 		glog.V(5).Infoln("sent writeDataPartResult",
-			s.req.requuid, partName, s.bkname, s.objname)
+			s.req.requuid, part.Name, s.bkname, s.objname)
 	case <-s.quitChan:
-		glog.V(5).Infoln("write data part quit", s.req.requuid, partName, s.bkname, s.objname)
+		glog.V(5).Infoln("write data part quit", s.req.requuid, part.Name, s.bkname, s.objname)
 	case <-time.After(RWTimeOutSecs * time.Second):
 		glog.Errorln("send writeDataPartResult timeout",
-			s.req.requuid, partName, s.bkname, s.objname)
+			s.req.requuid, part.Name, s.bkname, s.objname)
 	}
-
 }
 
 func (s *S3PutObject) waitAndAddDataPart(partNum int) (status int, errmsg string) {
@@ -303,6 +302,11 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 // this func will update data blocks and etag in ObjectMD
 func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 	r := s.req.r
+	if r.ContentLength == 0 {
+		s.md.Smd.Etag = ZeroDataETag
+		return StatusOK, StatusOKStr
+	}
+
 	if r.ContentLength <= DataBlockSize && r.ContentLength != -1 {
 		return s.putSmallObjectData()
 	}
@@ -421,9 +425,11 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 				glog.V(2).Infoln("write data part", s.md.Uuid, partNum, s.bkname, s.objname)
 
 				// write data part
-				partName := GenPartName(s.md.Uuid, partNum)
+				part := &DataPart{}
+				part.Name = GenPartName(s.md.Uuid, partNum)
+				part.Data = block
 				waitPart = true
-				go s.writeDataPart(block, partName, partNum)
+				go s.writeDataPart(part, partNum)
 			}
 
 			// increase part number
@@ -494,6 +500,7 @@ func (s *S3PutObject) PutObject(w http.ResponseWriter, bkname string, objname st
 		// looks compression is not useful for ObjectMD.
 		// tried like /usr/local/bin/docker, 9MB, mdbyte is 2519, compress to 2524
 		b = snappy.Encode(nil, mdbyte)
+		glog.V(5).Infoln(s.req.requuid, "compressed md", b, len(mdbyte), bkname, objname)
 	}
 
 	// write out ObjectMD
@@ -504,8 +511,7 @@ func (s *S3PutObject) PutObject(w http.ResponseWriter, bkname string, objname st
 		return
 	}
 
-	glog.V(0).Infoln("create object success", s.req.requuid, bkname, objname, s.md.Smd.Etag,
-		"compress", len(mdbyte), len(b))
+	glog.V(0).Infoln("create object success", s.req.requuid, bkname, objname, s.md.Smd.Etag)
 
 	w.Header().Set(ETag, s.md.Smd.Etag)
 	w.WriteHeader(status)
