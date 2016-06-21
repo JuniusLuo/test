@@ -47,14 +47,6 @@ func NewS3PutObject(req s3Request, s3io CloudIO, bkname string, objname string) 
 	return s
 }
 
-func (s *S3PutObject) addPart(block *DataBlock, partNum int) {
-	part := &DataPart{}
-	part.Name = GenPartName(s.md.Uuid, partNum)
-	part.Data = block
-
-	s.md.Data.DataParts = append(s.md.Data.DataParts, part)
-}
-
 func (s *S3PutObject) readFullBuf(readBuf []byte) (n int, err error) {
 	readZero := false
 	var rlen int
@@ -126,11 +118,11 @@ func (s *S3PutObject) putSmallObjectData() (status int, errmsg string) {
 		glog.V(2).Infoln("data block exists", s.req.requuid, md5str, r.ContentLength)
 	}
 
-	block := &DataBlock{}
-	block.Blocks = append(block.Blocks, md5str)
+	part := &DataPart{}
+	part.Name = GenPartName(s.md.Uuid, 0)
+	part.Blocks = append(part.Blocks, md5str)
 
-	// add to data block
-	s.addPart(block, 0)
+	s.md.Data.DataParts = append(s.md.Data.DataParts, part)
 
 	// set etag
 	s.md.Smd.Size = int64(n)
@@ -185,9 +177,14 @@ type writeDataPartResult struct {
 	errmsg   string
 }
 
-// create the part object for the block
+// create the data part object
 func (s *S3PutObject) writeDataPart(part *DataPart, partNum int) {
 	glog.V(2).Infoln("start creating data part", s.req.requuid, part.Name, s.bkname, s.objname)
+
+	partMd := &DataPartMD{}
+	partMd.BucketName = s.md.Smd.Bucket
+	partMd.ObjectName = s.md.Smd.Name
+	part.Md = partMd
 
 	res := writeDataPartResult{part.Name, partNum, StatusOK, StatusOKStr}
 
@@ -242,7 +239,7 @@ func (s *S3PutObject) waitAndAddDataPart(partNum int) (status int, errmsg string
 	return StatusOK, StatusOKStr
 }
 
-func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart bool, partNum int) (status int, errmsg string) {
+func (s *S3PutObject) waitLastWrite(waitWrite bool, part *DataPart, waitPart bool, partNum int) (status int, errmsg string) {
 	// wait the last write
 	if waitWrite {
 		glog.V(5).Infoln("wait the last block write", s.req.requuid, s.bkname, s.objname)
@@ -264,7 +261,7 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 		}
 		s.totalBlocks++
 		// add to data block
-		block.Blocks = append(block.Blocks, res.md5str)
+		part.Blocks = append(part.Blocks, res.md5str)
 	}
 
 	// wait the last part
@@ -278,9 +275,9 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 		}
 
 		glog.V(5).Infoln("add the last part",
-			s.req.requuid, partNum, len(block.Blocks), s.bkname, s.objname)
+			s.req.requuid, partNum, len(part.Blocks), s.bkname, s.objname)
 
-		s.addPart(block, partNum)
+		s.md.Data.DataParts = append(s.md.Data.DataParts, part)
 	} else {
 		// wait the data part
 		status, errmsg = s.waitAndAddDataPart(partNum - 1)
@@ -288,11 +285,11 @@ func (s *S3PutObject) waitLastWrite(waitWrite bool, block *DataBlock, waitPart b
 			return status, errmsg
 		}
 
-		glog.V(2).Infoln("check the last part",
-			s.req.requuid, partNum, len(block.Blocks), s.bkname, s.objname)
+		glog.V(2).Infoln("handle the last part", s.req.requuid, "part", partNum,
+			"block count", len(part.Blocks), s.bkname, s.objname)
 
 		// add the last part
-		s.addPart(block, partNum)
+		s.md.Data.DataParts = append(s.md.Data.DataParts, part)
 	}
 
 	return StatusOK, StatusOKStr
@@ -312,8 +309,9 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 	}
 
 	// the first block is the same with the one in ObjectMD
-	block := &DataBlock{}
+	part := &DataPart{}
 	partNum := 0
+	part.Name = GenPartName(s.md.Uuid, partNum)
 	waitPart := false
 	s.partChan = make(chan writeDataPartResult)
 
@@ -389,7 +387,7 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 			s.totalBlocks++
 
 			// add to data block
-			block.Blocks = append(block.Blocks, res.md5str)
+			part.Blocks = append(part.Blocks, res.md5str)
 		}
 
 		// write data block
@@ -405,14 +403,14 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 		go s.writeOneDataBlock(writeBuf[:n], md5ck, etag)
 
 		// check whether need to split data to parts
-		if len(block.Blocks) >= MaxDataBlocks {
+		if len(part.Blocks) >= MaxDataBlocks {
 			// object has lots of blocks, split to parts
 			// first block part will be stored in ObjectMD
 			glog.V(2).Infoln("split data blocks to parts",
-				s.req.requuid, partNum, len(block.Blocks), s.bkname, s.objname)
+				s.req.requuid, partNum, len(part.Blocks), s.bkname, s.objname)
 
 			if partNum == 0 {
-				s.addPart(block, 0)
+				s.md.Data.DataParts = append(s.md.Data.DataParts, part)
 			} else if partNum >= 1 {
 				if partNum > 1 {
 					// wait the data part
@@ -425,22 +423,20 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 				glog.V(2).Infoln("write data part", s.md.Uuid, partNum, s.bkname, s.objname)
 
 				// write data part
-				part := &DataPart{}
-				part.Name = GenPartName(s.md.Uuid, partNum)
-				part.Data = block
 				waitPart = true
 				go s.writeDataPart(part, partNum)
 			}
 
 			// increase part number
 			partNum++
-			// create a new DataBlock
-			block = &DataBlock{}
+			// create a new DataPart
+			part = &DataPart{}
+			part.Name = GenPartName(s.md.Uuid, partNum)
 		}
 	}
 
 	// wait the possible outgoing block/part write
-	status, errmsg = s.waitLastWrite(waitWrite, block, waitPart, partNum)
+	status, errmsg = s.waitLastWrite(waitWrite, part, waitPart, partNum)
 	if status != StatusOK {
 		return status, errmsg
 	}

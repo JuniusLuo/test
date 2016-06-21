@@ -65,14 +65,19 @@ message ObjectData {
 }
 
 message DataPart {
-  // part name
+  // part name, format: uuid.partNum
   string name = 1;
+  // the reverse MD for part to know its object, nil if DataPart is embeded
+  DataPartMD md = 2;
   // the possible embeded blocks
-  DataBlock data = 2;
+  repeated string blocks = 3;
 }
 
-message DataBlock {
-  repeated string blocks = 1;
+message DataPartMD {
+  // bucket name
+  string bucketName = 1;
+  // object name
+  string objectName = 2;
 }
 
 message ObjectMD {

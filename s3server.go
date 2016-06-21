@@ -1,6 +1,7 @@
 package test
 
 import (
+	"encoding/hex"
 	"errors"
 	"flag"
 	"io"
@@ -63,7 +64,7 @@ func (s *S3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req := s3Request{requuid: u.String(), r: r}
+	req := s3Request{requuid: hex.EncodeToString(u[:]), r: r}
 
 	w.Header().Set(RequestID, req.requuid)
 
@@ -218,7 +219,7 @@ func (d *objectDataIOReader) isLastBlock(partNum int, blkIdx int) bool {
 
 	lastPart := data.DataParts[totalParts-1]
 	if partNum == totalParts-1 {
-		l := len(lastPart.Data.Blocks)
+		l := len(lastPart.Blocks)
 		if l == 0 {
 			// last part may not have any block
 			glog.V(5).Infoln("last part has no data, totalParts", totalParts, d.objmd.Smd)
@@ -242,7 +243,7 @@ func (d *objectDataIOReader) isValidReadBlock(partNum int, blkIdx int) bool {
 	}
 
 	// sanity check
-	blkCount := len(d.currPart.part.Data.Blocks)
+	blkCount := len(d.currPart.part.Blocks)
 	if blkIdx >= blkCount {
 		glog.Errorln("SanityError - ", d.req.requuid, "read unexist block",
 			blkIdx, "in part", d.currPart.partName, blkCount, smd.Bucket, smd.Name)
@@ -263,7 +264,7 @@ func (d *objectDataIOReader) readBlock(partNum int, blkIdx int, b []byte) dataBl
 
 	smd := d.objmd.Smd
 	dataPart := d.currPart.part
-	res.blkmd5 = dataPart.Data.Blocks[blkIdx]
+	res.blkmd5 = dataPart.Blocks[blkIdx]
 
 	res.n, res.status, res.errmsg = d.s3io.ReadDataBlockRange(res.blkmd5, 0, res.buf)
 
@@ -321,7 +322,7 @@ func (d *objectDataIOReader) prefetchPart(partNum int) {
 			res.status = InternalError
 			res.errmsg = "failed to Unmarshal DataPart"
 		} else {
-			glog.V(5).Infoln("prefetchPart success", d.req.requuid, partNum, len(part.Data.Blocks), d.objmd.Smd)
+			glog.V(5).Infoln("prefetchPart success", d.req.requuid, partNum, len(part.Blocks), d.objmd.Smd)
 			res.part = part
 		}
 	} else {
@@ -383,7 +384,7 @@ func (d *objectDataIOReader) waitPrefetchBlock(partNum int, blkInPart int) error
 				}
 
 				// prefetch the first block in the next part
-				if d.currPart.part.Data != nil && len(d.currPart.part.Data.Blocks) != 0 {
+				if len(d.currPart.part.Blocks) != 0 {
 					d.waitBlock = true
 					go d.prefetchBlock(d.currPart.partNum, 0, oldbuf)
 				}
@@ -634,7 +635,7 @@ func (s *S3Server) getObjectOp(w http.ResponseWriter, req s3Request, bkname stri
 	// check the first block read status
 	if rd.currBlock.status != StatusOK {
 		glog.Errorln("read first data block failed",
-			req.requuid, objmd.Data.DataParts[0].Data.Blocks[0],
+			req.requuid, objmd.Data.DataParts[0].Blocks[0],
 			rd.currBlock.status, rd.currBlock.errmsg, bkname, objname)
 		http.Error(w, rd.currBlock.errmsg, rd.currBlock.status)
 		return
