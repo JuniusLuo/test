@@ -37,8 +37,6 @@ type S3PutObject struct {
 	blockChan chan writeDataBlockResult
 	// chan to wait for the data part write done
 	partChan chan writeDataPartResult
-	// chan to notify the block/part routines to quit
-	quitChan chan bool
 }
 
 // NewS3PutObject creates a new S3PutObject instance
@@ -168,7 +166,7 @@ func (s *S3PutObject) writeOneDataBlock(buf []byte, md5ck hash.Hash, etag hash.H
 	select {
 	case s.blockChan <- res:
 		glog.V(5).Infoln("sent writeDataBlockResult", md5str, s.bkname, s.objname)
-	case <-s.quitChan:
+	case <-s.ctx.Done():
 		glog.V(5).Infoln("write data block quit", s.bkname, s.objname)
 	case <-time.After(RWTimeOutSecs * time.Second):
 		glog.Errorln("send writeDataBlockResult timeout", md5str, s.bkname, s.objname,
@@ -210,7 +208,7 @@ func (s *S3PutObject) writeDataPart(part *DataPart, partNum int) {
 	case s.partChan <- res:
 		glog.V(5).Infoln("sent writeDataPartResult",
 			s.requuid, part.Name, s.bkname, s.objname)
-	case <-s.quitChan:
+	case <-s.ctx.Done():
 		glog.V(5).Infoln("write data part quit", s.requuid, part.Name, s.bkname, s.objname)
 	case <-time.After(RWTimeOutSecs * time.Second):
 		glog.Errorln("send writeDataPartResult timeout",
@@ -330,10 +328,6 @@ func (s *S3PutObject) putObjectData() (status int, errmsg string) {
 	// chan to wait till the previous write completes
 	waitWrite := false
 	s.blockChan = make(chan writeDataBlockResult)
-
-	s.quitChan = make(chan bool)
-	// close at the end, to ensure all routines exit
-	defer close(s.quitChan)
 
 	var rlen int64
 	for rlen < r.ContentLength || r.ContentLength == -1 {

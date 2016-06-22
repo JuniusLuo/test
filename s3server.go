@@ -270,9 +270,6 @@ func (s *S3Server) getObjectOp(ctx context.Context, w http.ResponseWriter, r *ht
 	} else {
 		glog.V(1).Infoln("get object success", util.GetReqIDFromContext(ctx), bkname, objname, n, objmd.Smd)
 	}
-
-	// read done, close reader
-	rd.closeChan()
 }
 
 func (s *S3Server) delOp(ctx context.Context, w http.ResponseWriter, r *http.Request, bkname string, objname string) {
