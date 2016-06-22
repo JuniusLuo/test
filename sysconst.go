@@ -7,9 +7,8 @@ const (
 	// ObjectMD data block split threshold, 4k blocks would be 4k*32bytes=128KB
 	MaxDataBlocks = 4
 	// 30s timeout for every single read/write operation
-	RWTimeOutSecs    = 30
-	DefaultSeparator = "."
-	ZeroDataETag     = "d41d8cd98f00b204e9800998ecf8427e"
+	RWTimeOutSecs = 30
+	ZeroDataETag  = "d41d8cd98f00b204e9800998ecf8427e"
 )
 
 //const (

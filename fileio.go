@@ -21,8 +21,9 @@ type FileIO struct {
 
 // Misc const definition for FileIO
 const (
-	DefaultDirMode  = 0700
-	DefaultFileMode = 0600
+	DefaultDirMode   = 0700
+	DefaultFileMode  = 0600
+	DefaultSeparator = "."
 )
 
 // NewFileIO creates the FileIO instance
